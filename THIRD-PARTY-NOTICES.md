@@ -99,6 +99,28 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
+## 3DGUT Rasterizer (FlashSplat copy)
+
+- Path: `flashsplat/threedgut_flashsplat_tracer`
+- Source: `thirdparty/3DGRUT-ArtiFixer/threedgut_tracer` @ 62e1038b74b2edc01440fd4ddf5f080109b6faba
+- Repository: https://github.com/nv-tlabs/3DGRUT-ArtiFixer
+- License: Apache-2.0
+
+A copy of the 3DGUT rasterizer, modified to accumulate per-Gaussian alpha-blending weights
+per mask label. It builds as a separate torch extension and leaves the submodule untouched.
+See `flashsplat/threedgut_flashsplat_tracer/README.md` for the exact set of changes.
+
+## FlashSplat
+
+- Path: `flashsplat/solver.py`, and the accumulation hook in `flashsplat/threedgut_flashsplat_tracer`
+- Source: "FlashSplat: 2D to 3D Gaussian Splatting Segmentation Solved Optimally" (ECCV 2024),
+  https://github.com/florinshen/FlashSplat
+- License: see the upstream repository
+
+`flashsplat/solver.py` is a port of `multi_instance_opt` from the FlashSplat reference
+implementation. The rasterizer hook implements the same per-Gaussian, per-label
+accumulation of `alpha * transmittance` that FlashSplat adds to the 3DGS rasterizer.
+
 ## 3DGRUT
 
 - Path: `thirdparty/3DGRUT-ArtiFixer`

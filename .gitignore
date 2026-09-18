@@ -1,5 +1,11 @@
 # Taken from https://github.com/github/gitignore/blob/main/Python.gitignore
 
+# Downloaded model weights (see download/)
+/download/
+
+# macOS
+.DS_Store
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
