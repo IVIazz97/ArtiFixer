@@ -34,6 +34,30 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional transforms-style JSON camera trajectory to render instead of the dataset test loader.",
     )
+    parser.add_argument(
+        "--render_method",
+        default=None,
+        help="Optional render.method override (e.g. 3dgut, 3dgrt, threedgrut_flashsplat).",
+    )
+    parser.add_argument(
+        "--object_mask_path_override",
+        type=Path,
+        default=None,
+        help="Optional relative/absolute path to per-frame object-id masks (frame-indexed PNGs).",
+    )
+    parser.add_argument(
+        "--flashsplat_num_obj",
+        type=int,
+        default=None,
+        help="Optional override for render.flashsplat.num_obj.",
+    )
+    parser.add_argument(
+        "--flashsplat_require_object_mask",
+        type=str,
+        choices=("true", "false"),
+        default=None,
+        help="Optional override for render.flashsplat.require_object_mask.",
+    )
     return parser
 
 
@@ -102,6 +126,10 @@ def render_3dgrut_colmap(
     render_dataset_dir: Path | None = None,
     trajectory_path: Path | None = None,
     trajectory_output_subdir: str | None = None,
+    render_method: str | None = None,
+    object_mask_path_override: Path | None = None,
+    flashsplat_num_obj: int | None = None,
+    flashsplat_require_object_mask: bool | None = None,
 ) -> Path:
     dataset_dir = render_dataset_dir or colmap_dir
     config_overrides = {
@@ -122,6 +150,14 @@ def render_3dgrut_colmap(
         config_overrides["dataset.downsample_factor"] = downsample_factor
     if num_selected_indices is not None:
         config_overrides["num_selected_indices"] = num_selected_indices
+    if render_method is not None:
+        config_overrides["render.method"] = render_method
+    if object_mask_path_override is not None:
+        config_overrides["object_mask_path_override"] = str(object_mask_path_override)
+    if flashsplat_num_obj is not None:
+        config_overrides["render.flashsplat.num_obj"] = int(flashsplat_num_obj)
+    if flashsplat_require_object_mask is not None:
+        config_overrides["render.flashsplat.require_object_mask"] = bool(flashsplat_require_object_mask)
 
     renderer = Renderer.from_checkpoint(
         checkpoint_path=checkpoint,
@@ -157,6 +193,9 @@ def render_3dgrut_colmap(
 
 def main() -> None:
     args = build_parser().parse_args()
+    require_object_mask = None
+    if args.flashsplat_require_object_mask is not None:
+        require_object_mask = args.flashsplat_require_object_mask.lower() == "true"
     render_3dgrut_colmap(
         checkpoint=args.checkpoint,
         colmap_dir=args.colmap_dir,
@@ -167,6 +206,10 @@ def main() -> None:
         downsample_factor=args.downsample_factor,
         render_dataset_dir=args.render_dataset_dir,
         trajectory_path=args.trajectory_path,
+        render_method=args.render_method,
+        object_mask_path_override=args.object_mask_path_override,
+        flashsplat_num_obj=args.flashsplat_num_obj,
+        flashsplat_require_object_mask=require_object_mask,
     )
 
 

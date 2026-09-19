@@ -238,11 +238,13 @@ def scale_colmap_scene_to_images(image_dir: Path, scene: ColmapScene) -> ColmapS
 
         sx = width / float(camera.width)
         sy = height / float(camera.height)
-        assert np.isclose(sx, sy), (
-            f"COLMAP camera/image size mismatch for {image_name!r}: "
-            f"camera {camera.id} is {int(camera.width)}x{int(camera.height)}, "
-            f"but {image_path} is {width}x{height}"
-        )
+        if not np.isclose(sx, sy, rtol=1e-2, atol=1e-3):
+            raise AssertionError(
+                f"COLMAP camera/image size mismatch for {image_name!r}: "
+                f"camera {camera.id} is {int(camera.width)}x{int(camera.height)}, "
+                f"but {image_path} is {width}x{height}"
+            )
+        sx = sy = float((sx + sy) * 0.5)
         params = scaled_camera_params(camera, sx, sy)
         print(
             f"Scaling COLMAP camera {camera.id} from {int(camera.width)}x{int(camera.height)} "
@@ -257,6 +259,50 @@ def scale_colmap_scene_to_images(image_dir: Path, scene: ColmapScene) -> ColmapS
         for image in scene.images
     ]
     return ColmapScene(cameras=scaled_cameras, images=scaled_images)
+
+
+def normalize_near_shared_camera_scene(scene: ColmapScene) -> ColmapScene:
+    camera_by_id = {camera.id: camera for camera in scene.cameras}
+    used_cameras = [camera_by_id[camera_id] for camera_id in sorted({image.camera_id for image in scene.images})]
+    if len(used_cameras) <= 1:
+        return scene
+
+    models = {camera.model for camera in used_cameras}
+    assert len(models) == 1, f"Cannot normalize mixed camera models: {sorted(models)}"
+    model = next(iter(models))
+    assert model in SUPPORTED_CAMERA_MODELS, f"Unsupported camera model for shared-camera normalization: {model}"
+
+    widths = np.array([float(camera.width) for camera in used_cameras], dtype=np.float64)
+    heights = np.array([float(camera.height) for camera in used_cameras], dtype=np.float64)
+    assert widths.max() / widths.min() <= 1.05 and heights.max() / heights.min() <= 1.05, (
+        "Refusing to normalize cameras with image dimensions differing by more than 5%"
+    )
+
+    target_width = int(round(np.median(widths)))
+    target_height = int(round(np.median(heights)))
+    scaled_params = []
+    scale_by_camera: dict[int, tuple[float, float]] = {}
+    for camera in used_cameras:
+        sx = target_width / float(camera.width)
+        sy = target_height / float(camera.height)
+        scale_by_camera[camera.id] = (sx, sy)
+        scaled_params.append(scaled_camera_params(camera, sx, sy))
+
+    normalized_camera = used_cameras[0]._replace(
+        id=1,
+        width=target_width,
+        height=target_height,
+        params=np.median(np.stack(scaled_params), axis=0),
+    )
+    normalized_images = [
+        scale_image_observations(image, *scale_by_camera[image.camera_id])._replace(camera_id=1)
+        for image in scene.images
+    ]
+    print(
+        f"Normalizing {len(used_cameras)} near-shared cameras to one {target_width}x{target_height} {model} camera",
+        flush=True,
+    )
+    return ColmapScene(cameras=[normalized_camera], images=normalized_images)
 
 
 def write_colmap_cameras(path: Path, cameras: Sequence[Camera]) -> None:
@@ -294,6 +340,50 @@ def reset_prepared_scene(path: Path) -> None:
 def symlink_images(source_image_dir: Path, target_image_dir: Path, images: Sequence[Image]) -> None:
     for image in images:
         (target_image_dir / image_basename(image)).symlink_to(source_image_path(source_image_dir, image).resolve())
+
+
+def write_downscaled_images(
+    source_image_dir: Path,
+    target_image_dir: Path,
+    images: Sequence[Image],
+    cameras: Sequence[Camera],
+    downscale_factor: int,
+) -> None:
+    assert downscale_factor >= 1, f"Expected downscale factor >= 1, got {downscale_factor}"
+    camera_by_id = {camera.id: camera for camera in cameras}
+    for image in images:
+        camera = camera_by_id[image.camera_id]
+        src_path = source_image_path(source_image_dir, image).resolve()
+        dst_path = target_image_dir / image_basename(image)
+        with PILImage.open(src_path) as pil_image:
+            target_size = (
+                max(1, int(round(float(camera.width) / downscale_factor))),
+                max(1, int(round(float(camera.height) / downscale_factor))),
+            )
+            resized = pil_image.resize(target_size, resample=PILImage.Resampling.LANCZOS)
+            resized.save(dst_path)
+
+
+def prepare_images(
+    source_image_dir: Path,
+    target_image_dir: Path,
+    images: Sequence[Image],
+    cameras: Sequence[Camera],
+    downscale_factor: int,
+) -> None:
+    camera_by_id = {camera.id: camera for camera in cameras}
+    needs_resize = downscale_factor != 1
+    if not needs_resize:
+        for image in images:
+            camera = camera_by_id[image.camera_id]
+            with PILImage.open(source_image_path(source_image_dir, image)) as pil_image:
+                if pil_image.size != (int(camera.width), int(camera.height)):
+                    needs_resize = True
+                    break
+    if not needs_resize:
+        symlink_images(source_image_dir, target_image_dir, images)
+        return
+    write_downscaled_images(source_image_dir, target_image_dir, images, cameras, downscale_factor)
 
 
 def write_sparse_model(source_sparse_dir: Path, target_sparse_dir: Path, scene: ColmapScene) -> None:
@@ -469,7 +559,13 @@ def prepare_files(
         return
 
     reset_prepared_scene(paths.threedgrut_input_dir)
-    symlink_images(image_dir, paths.threedgrut_input_dir / "images", scene.images)
+    prepare_images(
+        image_dir,
+        paths.threedgrut_input_dir / "images",
+        scene.images,
+        scene.cameras,
+        args.train_image_downscale_factor,
+    )
     write_sparse_model(sparse_dir, paths.threedgrut_input_dir / "sparse/0", scene)
     write_transforms_json(paths.threedgrut_input_dir / "nerfstudio/transforms.json", scene)
     write_selected_indices(paths, selected_indices, scene.images)
@@ -501,16 +597,21 @@ def require_reconstruction_checkpoint(paths: PreparedPaths, args: argparse.Names
 
 
 def threedgrut_train_overrides(paths: PreparedPaths, args: argparse.Namespace) -> list[str]:
-    return [
+    overrides = [
         f"path={paths.threedgrut_input_dir}",
         f"out_dir={paths.reconstruction_run_dir}",
         f"selected_indices_file={paths.selected_indices_path}",
+        "dataset.downsample_factor=1",
+        "num_workers=0",
         "test_last=False",
         "export_ingp.enabled=False",
         f"experiment_name={paths.scene_id}",
         f"n_iterations={args.reconstruction_steps}",
         f"checkpoint.iterations=[{args.reconstruction_steps}]",
     ]
+    if args.max_gaussians is not None:
+        overrides.append(f"strategy.add.max_n_gaussians={args.max_gaussians}")
+    return overrides
 
 
 def run_reconstruction(args: argparse.Namespace, paths: PreparedPaths) -> bool:
@@ -765,6 +866,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="3DGRUT MCMC training iterations and checkpoint step.",
     )
     parser.add_argument(
+        "--train_image_downscale_factor",
+        type=int,
+        default=1,
+        help=(
+            "Optional factor for physically downscaling prepared training images before reconstruction. "
+            "Use 1 to keep original resolution, 2 for half resolution, 4 for quarter resolution, etc."
+        ),
+    )
+    parser.add_argument(
+        "--normalize_near_shared_cameras",
+        action="store_true",
+        default=False,
+        help="Collapse many near-identical COLMAP cameras into one fixed prepared calibration.",
+    )
+    parser.add_argument(
         "--reconstruction_checkpoint",
         type=Path,
         default=None,
@@ -779,12 +895,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional precomputed metric scale. When omitted, the scale phase runs MoGe alignment.",
     )
+    parser.add_argument(
+        "--max_gaussians",
+        type=int,
+        default=None,
+        help="Optional override for 3DGUT MCMC strategy.add.max_n_gaussians.",
+    )
 
     return parser
 
 
 def prepare_colmap_scene(args: argparse.Namespace) -> None:
     phases = parse_phases(args.phases)
+    assert args.train_image_downscale_factor >= 1, "--train_image_downscale_factor must be >= 1"
 
     args.colmap_dir = args.colmap_dir.expanduser().resolve()
     args.output_root = args.output_root.expanduser().resolve()
@@ -799,6 +922,8 @@ def prepare_colmap_scene(args: argparse.Namespace) -> None:
     scene = read_colmap_scene(sparse_dir)
     require_unique_basenames(scene.images)
     scene = scale_colmap_scene_to_images(image_dir, scene)
+    if args.normalize_near_shared_cameras:
+        scene = normalize_near_shared_camera_scene(scene)
 
     selected_indices = resolve_selected_indices(args, scene.images)
     paths = prepared_paths(args.output_root, args.output_root.name, args.reconstruction_steps)

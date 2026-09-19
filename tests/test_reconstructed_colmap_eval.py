@@ -95,8 +95,14 @@ class ReconstructedColmapEvalDatasetTests(unittest.TestCase):
             )
             item = dataset[0]
 
-        self.assertEqual(tuple(item["rgb_neighbors"].shape[-2:]), (16, 32))
-        self.assertEqual(tuple(item["rgb_rendered"].shape[-2:]), (32, 64))
+        conditioning_size = (
+            reconstructed_colmap_eval.ARTIFIXER_CONDITIONING_HEIGHT,
+            reconstructed_colmap_eval.ARTIFIXER_CONDITIONING_WIDTH,
+        )
+        self.assertEqual(tuple(item["rgb_neighbors"].shape[-2:]), conditioning_size)
+        self.assertEqual(tuple(item["rgb_rendered"].shape[-2:]), conditioning_size)
+        # Outputs are resized back to the native GT resolution.
+        self.assertEqual((item["target_h"], item["target_w"]), (16, 32))
         self.assertEqual(tuple(item["camera_rays"].shape[-3:-1]), tuple(item["rgb_rendered"].shape[-2:]))
 
 

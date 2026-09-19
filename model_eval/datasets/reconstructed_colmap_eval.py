@@ -35,11 +35,21 @@ from model_training.data.utils import (
     generate_inference_pairs,
     load_encoded_prompt,
     load_indexed_frames,
-    resize_to_multiple_of_16,
     visualize_inference_pairs,
 )
 
 DEFAULT_RECONSTRUCTED_COLMAP_NUM_VIEWS = 12
+ARTIFIXER_CONDITIONING_HEIGHT = 480
+ARTIFIXER_CONDITIONING_WIDTH = 832
+
+
+def resize_reconstruction_conditioning(frames: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.interpolate(
+        frames.float(),
+        size=(ARTIFIXER_CONDITIONING_HEIGHT, ARTIFIXER_CONDITIONING_WIDTH),
+        mode="bilinear",
+        align_corners=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -345,14 +355,14 @@ class ReconstructedColmapEvalDataset(torch.utils.data.Dataset):
 
         # Load rendered images
         rgb_rendered = load_indexed_frames(scene.render_dir, frame_indices, filename_format="{:05d}.png")
-        item["rgb_rendered"] = resize_to_multiple_of_16(rgb_rendered)
+        item["rgb_rendered"] = resize_reconstruction_conditioning(rgb_rendered)
         output_size_source = rgb_rendered
 
         # Load ground truth images
         if scene.has_gt:
             gt_file_paths = [transforms["frames"][x]["file_path"] for x in frame_indices]
             rgb_gt = load_frames_from_prepared_paths(scene.image_root, gt_file_paths)
-            item["rgb_gt"] = resize_to_multiple_of_16(rgb_gt)
+            item["rgb_gt"] = resize_reconstruction_conditioning(rgb_gt)
             output_size_source = rgb_gt
 
         item["target_h"] = output_size_source.shape[-2]
@@ -361,11 +371,11 @@ class ReconstructedColmapEvalDataset(torch.utils.data.Dataset):
         # Load neighbor frames
         neighbor_file_paths = [transforms["frames"][x]["file_path"] for x in neighbor_indices]
         rgb_neighbors = load_frames_from_prepared_paths(scene.image_root, neighbor_file_paths)
-        item["rgb_neighbors"] = resize_to_multiple_of_16(rgb_neighbors)
+        item["rgb_neighbors"] = resize_reconstruction_conditioning(rgb_neighbors)
 
         # Load opacity
         opacity = load_indexed_frames(scene.opacity_dir, frame_indices, filename_format="{:05d}.png", grayscale=True)
-        item["opacity"] = resize_to_multiple_of_16(opacity).squeeze(1)
+        item["opacity"] = resize_reconstruction_conditioning(opacity).squeeze(1)
 
         # Camera rays condition the target frames, so match the rendered target tensor.
         H, W = item["rgb_rendered"].shape[-2], item["rgb_rendered"].shape[-1]

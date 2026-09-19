@@ -44,21 +44,27 @@ if torch.cuda.is_available():
 
 # ── FlashAttention ──
 print("\n=== FlashAttention ===")
-# flash_attn namespace exists (created by FA4's flash_attn.cute) but has no __version__
-# when FA2 wheel is not separately installed — that's fine for H100/GB200 targets.
-check("flash_attn namespace", lambda: (__import__("flash_attn"), "importable (FA4 provides flash_attn.cute)")[1])
+major = torch.cuda.get_device_capability(0)[0] if torch.cuda.is_available() else 0
+requires_external_flash_attn = major >= 9
 
-# FA3 - check both the package and the interface module
-if not check("flash_attn_3 package", lambda: __import__("flash_attn_3").__name__):
-    failures += 1
-if not check("flash_attn_interface (FA3 API)", lambda: (__import__("flash_attn_interface"), "importable")[1]):
-    failures += 1
+if requires_external_flash_attn:
+    # flash_attn namespace exists (created by FA4's flash_attn.cute) but has no __version__
+    # when FA2 wheel is not separately installed — that's fine for H100/GB200 targets.
+    check("flash_attn namespace", lambda: (__import__("flash_attn"), "importable (FA4 provides flash_attn.cute)")[1])
 
-# FA4
-fa4_ok = check("flash_attn.cute (FA4)", lambda: (importlib.import_module("flash_attn.cute"), "importable")[1])
-if not fa4_ok:
-    # FA4 might fail on non-Blackwell GPUs at import time - check if package is at least installed
-    check("flash-attn-4 installed (pip)", lambda: (importlib.metadata.version("flash-attn-4")))
+    # FA3 - check both the package and the interface module.
+    if not check("flash_attn_3 package", lambda: __import__("flash_attn_3").__name__):
+        failures += 1
+    if not check("flash_attn_interface (FA3 API)", lambda: (__import__("flash_attn_interface"), "importable")[1]):
+        failures += 1
+
+    # FA4
+    fa4_ok = check("flash_attn.cute (FA4)", lambda: (importlib.import_module("flash_attn.cute"), "importable")[1])
+    if not fa4_ok:
+        # FA4 might fail on non-Blackwell GPUs at import time - check if package is at least installed.
+        check("flash-attn-4 installed (pip)", lambda: (importlib.metadata.version("flash-attn-4")))
+else:
+    print("  [SKIP] external FlashAttention packages: not required on sm_80; Artifixer uses auto SDPA/cuDNN")
 
 # PyTorch FA backends
 try:

@@ -84,6 +84,50 @@ docker run --gpus all --ipc=host --rm -it \
 cd /workspace/artifixer
 ```
 
+## FlashSplat Compatibility on Native 3DGUT (Experimental)
+
+Use the dedicated entrypoint below to run the FlashSplat compatibility path through native 3DGUT rasterization without changing the standard 3DGRUT render flow.
+
+Expected mask layout under the COLMAP scene root:
+
+```text
+<COLMAP_SCENE>/
+    images/
+    sparse/0/
+    masks_npy/
+        frame_00001.npy
+        frame_00002.npy
+        ...
+```
+
+The loader accepts both PNG and NPY object-id masks. It first tries exact image-stem matches, then index-based names such as `00000.*` and `frame_00001.*`.
+
+```bash
+source .venv/bin/activate
+export PYTHONPATH="$PWD/thirdparty/3DGRUT-ArtiFixer:${PYTHONPATH:-}"
+
+python -m data_processing.run_flashsplat_objremoval \
+    --checkpoint /path/to/ckpt_30000.pt \
+    --colmap_dir /path/to/COLMAP_SCENE \
+    --output_root /path/to/recon_results \
+    --experiment_name reconstruction \
+    --selected_indices /path/to/selected_indices.json \
+    --object_mask_path_override masks_npy \
+    --save_png \
+    --save_mp4
+```
+
+Outputs are written to:
+
+```text
+<output_root>/<experiment_name>/<scene_name>/ours_<step>/flashsplat_compat_3dgut/
+    renders/
+    opacity/
+    transmittance/
+    density/
+    metadata.json
+```
+
 Download a release checkpoint from the [ArtiFixer Hugging Face repo](https://huggingface.co/nvidia/ArtiFixer). Two variants are available:
 
 | Checkpoint | Base model | Parameters | Notes |
