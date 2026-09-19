@@ -51,6 +51,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="Background bias in [-1, 1]. Larger is more conservative (tighter objects).",
     )
+    parser.add_argument(
+        "--min-background-contribution",
+        type=float,
+        default=0.0,
+        help="Keep a Gaussian in the solved background only when its total accumulated "
+        "density*transmittance is greater than this value.",
+    )
     parser.add_argument("--output_root", type=Path, required=True)
     parser.add_argument(
         "--outputs",
@@ -66,7 +73,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reuse a previously saved accumulator instead of re-rendering. Lets you re-solve "
         "at a different --gamma for free.",
     )
+    parser.add_argument(
+        "--save-hit-count",
+        action="store_true",
+        help="Save per-Gaussian count of annotated views with positive contribution.",
+    )
     parser.add_argument("--downsample_factor", type=float, default=None)
+    parser.add_argument(
+        "--test_split_interval",
+        type=int,
+        default=None,
+        help="Override dataset.test_split_interval. The 'test' split is what gets swept for "
+        "accumulation, so pass <= 0 to use every view instead of the default 1-in-N holdout.",
+    )
     return parser
 
 
@@ -83,6 +102,8 @@ def main() -> None:
     config_overrides = {"path": str(args.colmap_dir)}
     if args.downsample_factor is not None:
         config_overrides["dataset.downsample_factor"] = args.downsample_factor
+    if args.test_split_interval is not None:
+        config_overrides["dataset.test_split_interval"] = args.test_split_interval
 
     model, conf, global_step = accumulate.load_model(args.checkpoint, config_overrides)
     dataset, dataloader = accumulate.build_test_dataloader(conf)
@@ -99,23 +120,43 @@ def main() -> None:
             )
         print(f"Reusing accumulator from {args.contribution}")
     else:
-        contribution = accumulate.accumulate_contributions(
-            model, dataset, dataloader, args.mask_dir, num_objects
+        accumulated = accumulate.accumulate_contributions(
+            model,
+            dataset,
+            dataloader,
+            args.mask_dir,
+            num_objects,
+            return_hit_count=args.save_hit_count,
         )
+        if args.save_hit_count:
+            contribution, hit_count = accumulated
+        else:
+            contribution = accumulated
+
+    if args.min_background_contribution < 0:
+        raise SystemExit("--min-background-contribution must be >= 0")
 
     labels = solver.multi_instance_opt(contribution, gamma=args.gamma)
+    total_contribution = contribution.sum(dim=0)
+    labels[0] &= total_contribution > args.min_background_contribution
     counts = {int(i): int(labels[i].sum()) for i in range(labels.shape[0])}
-    print(f"Gaussians per label (0 = background): {counts}")
+    print(
+        f"Gaussians per label (0 = background, min background contribution "
+        f"> {args.min_background_contribution}): {counts}"
+    )
 
     if "labels" in args.outputs:
         torch.save(contribution.cpu(), args.output_root / "contribution.pt")
         torch.save(labels.cpu(), args.output_root / "labels.pt")
+        if args.save_hit_count:
+            torch.save(hit_count.cpu(), args.output_root / "hit_count.pt")
         (args.output_root / "summary.json").write_text(
             json.dumps(
                 {
                     "num_objects": num_objects,
                     "num_gaussians": int(model.num_gaussians),
                     "gamma": args.gamma,
+                    "min_background_contribution": args.min_background_contribution,
                     "global_step": global_step,
                     "gaussians_per_label": counts,
                 },

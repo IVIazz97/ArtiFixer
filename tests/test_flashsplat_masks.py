@@ -63,6 +63,35 @@ class ObjectIdMaskTest(unittest.TestCase):
             Image.fromarray(np.array([[0, 5]], dtype=np.uint8)).save(Path(tmpdir) / "b.png")
             self.assertEqual(infer_num_objects(tmpdir), 5)
 
+    def test_npy_mask_preserves_raw_object_ids(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "00000.npy"
+            np.save(path, np.array([[0, 3, 7], [7, 0, 3]], dtype=np.uint8))
+            ids = load_object_id_mask(path, actual_h=2, actual_w=3)
+
+        self.assertEqual(ids.tolist(), [0, 3, 7, 7, 0, 3])
+        self.assertEqual(ids.dtype.__str__(), "torch.int32")
+
+    def test_npy_mask_nearest_resize_does_not_invent_ids(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "00000.npy"
+            np.save(path, np.array([[0, 4], [4, 9]], dtype=np.uint8))
+            ids = load_object_id_mask(path, actual_h=6, actual_w=8)
+
+        self.assertEqual(ids.shape[0], 48)
+        self.assertEqual(sorted(set(ids.tolist())), [0, 4, 9])
+
+    def test_mask_path_matches_npy_on_stem(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            np.save(Path(tmpdir) / "frame_0007.npy", np.zeros((1, 1), dtype=np.uint8))
+            resolved = mask_path_for_frame(tmpdir, "/data/scene/images/frame_0007.jpg")
+            self.assertEqual(resolved.name, "frame_0007.npy")
+
+    def test_infer_num_objects_reads_npy(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            np.save(Path(tmpdir) / "a.npy", np.array([[0, 1]], dtype=np.uint8))
+            self.assertEqual(infer_num_objects(tmpdir), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

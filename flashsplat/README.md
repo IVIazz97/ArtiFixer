@@ -118,9 +118,9 @@ All under `flashsplat/`, plus one CLI in `data_processing/`.
 
 | File | Role |
 | --- | --- |
-| `flashsplat/masks.py` | `load_object_id_mask(path, h, w) -> int32 [h*w]`. **Must not** use `Image.convert("L")` (remaps palette indices), must not divide by 255 or threshold, and resizes with `Image.NEAREST` only — all three would corrupt object ids. Also `mask_path_for_frame` (stem matching) and `infer_num_objects`. |
+| `flashsplat/masks.py` | `load_object_id_mask(path, h, w) -> int32 [h*w]`. **Must not** use `Image.convert("L")` (remaps palette indices), must not divide by 255 or threshold, and resizes with `Image.NEAREST` only — all three would corrupt object ids. Also `mask_path_for_frame`/`find_mask_path_for_frame` (stem matching; the latter returns `None` instead of raising, for sparse mask sets) and `infer_num_objects`. |
 | `flashsplat/solver.py` | `multi_instance_opt(all_contrib [K+1, N], gamma) -> bool [K+1, N]`. Per object: stack `[total - obj, obj]`, `F.normalize(dim=0)`, add `gamma` to the background row, `argmax`. |
-| `flashsplat/accumulate.py` | `load_model` (loads a checkpoint, **swaps in the FlashSplat tracer**), `build_test_dataloader`, `allocate_accumulator`, `accumulate_contributions` (the multi-view sweep). |
+| `flashsplat/accumulate.py` | `load_model` (loads a checkpoint, **swaps in the FlashSplat tracer**), `build_test_dataloader`, `allocate_accumulator`, `accumulate_contributions` (the multi-view sweep; skips views without a mask, so `--mask_dir` may cover only a subset of views). |
 | `flashsplat/export.py` | `segment_model`, `save_segmented_checkpoint`, `save_segmented_ply`, `save_overlay_renders`. |
 | `data_processing/run_flashsplat_segmentation.py` | CLI tying it together, styled after `run_artifixer3d.py`. |
 

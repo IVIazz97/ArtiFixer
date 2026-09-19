@@ -84,49 +84,39 @@ docker run --gpus all --ipc=host --rm -it \
 cd /workspace/artifixer
 ```
 
-## FlashSplat Compatibility on Native 3DGUT (Experimental)
+## FlashSplat Object Removal (Experimental)
 
-Use the dedicated entrypoint below to run the FlashSplat compatibility path through native 3DGUT rasterization without changing the standard 3DGRUT render flow.
+Segments the Gaussians of a trained 3DGUT reconstruction with per-view object-id masks, then renders the scene with the object removed. See [`flashsplat/README.md`](flashsplat/README.md) for how it works.
 
-Expected mask layout under the COLMAP scene root:
-
-```text
-<COLMAP_SCENE>/
-    images/
-    sparse/0/
-    masks_npy/
-        frame_00001.npy
-        frame_00002.npy
-        ...
-```
-
-The loader accepts both PNG and NPY object-id masks. It first tries exact image-stem matches, then index-based names such as `00000.*` and `frame_00001.*`.
+Masks are PNG or NPY object-id images (`0` = background, `1..K` = objects), named after the image they annotate (`frame_00001.jpg` → `frame_00001.npy`). Views without a mask are skipped, so a mask directory may cover only a subset of the views.
 
 ```bash
-source .venv/bin/activate
 export PYTHONPATH="$PWD/thirdparty/3DGRUT-ArtiFixer:${PYTHONPATH:-}"
 
-python -m data_processing.run_flashsplat_objremoval \
+# 1. Solve per-Gaussian labels: writes labels.pt, contribution.pt, hit_count.pt, summary.json
+python -m data_processing.run_flashsplat_segmentation \
     --checkpoint /path/to/ckpt_30000.pt \
-    --colmap_dir /path/to/COLMAP_SCENE \
-    --output_root /path/to/recon_results \
-    --experiment_name reconstruction \
-    --selected_indices /path/to/selected_indices.json \
-    --object_mask_path_override masks_npy \
-    --save_png \
-    --save_mp4
+    --colmap_dir /path/to/prepared_colmap_scene \
+    --mask_dir /path/to/masks_npy \
+    --output_root /path/to/flashsplat_out \
+    --outputs labels --save-hit-count \
+    --test_split_interval -1          # sweep every view, not just the 1-in-N test split
+
+# 2. Render foreground-only and background-only views into foreground_renders/ and background_renders/
+python -m data_processing.render_flashsplat_extraction \
+    --checkpoint /path/to/ckpt_30000.pt \
+    --colmap_dir /path/to/prepared_colmap_scene \
+    --labels /path/to/flashsplat_out/labels.pt \
+    --contribution /path/to/flashsplat_out/contribution.pt \
+    --hit-count /path/to/flashsplat_out/hit_count.pt \
+    --normalize-by-hit-count --min-total-contribution 0.1 \
+    --background-convex-hull --convex-hull-trim-percentile 99.5 \
+    --background label0 --object_id 1 \
+    --output_root /path/to/flashsplat_out \
+    --test_split_interval -1
 ```
 
-Outputs are written to:
-
-```text
-<output_root>/<experiment_name>/<scene_name>/ours_<step>/flashsplat_compat_3dgut/
-    renders/
-    opacity/
-    transmittance/
-    density/
-    metadata.json
-```
+`scripts/create_reconstructed_split.py SCENE_ROOT` writes the `split.json` that `model_eval.run_inference` consumes for a prepared scene, and `model_eval/compute_metrics_colmap_renders.py` scores renders against the source images.
 
 Download a release checkpoint from the [ArtiFixer Hugging Face repo](https://huggingface.co/nvidia/ArtiFixer). Two variants are available:
 

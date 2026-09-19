@@ -3,6 +3,10 @@
 # Downloaded model weights (see download/)
 /download/
 
+# Local datasets and checkpoints: never commit data (model_eval/datasets/ is code)
+/datasets
+/checkpoints/
+
 # macOS
 .DS_Store
 

@@ -9,19 +9,45 @@ from pathlib import Path
 
 import torch
 
-from flashsplat.masks import load_object_id_mask, mask_path_for_frame
+from flashsplat.masks import find_mask_path_for_frame, load_object_id_mask
 from flashsplat.threedgut_flashsplat_tracer import Tracer as FlashSplatTracer
 
 # 4 bytes per float32 entry of the [num_objects + 1, num_gaussians] accumulator.
 _ACCUMULATOR_WARN_BYTES = 4 << 30
 
 
+class _UnbuiltTracer:
+    """Stands in for threedgut_tracer.Tracer wherever MixtureOfGaussians builds one.
+
+    Both the stock ``lib3dgut_cc`` and this package's ``lib3dgut_flashsplat_cc`` define a
+    C++ ``SplatRaster`` class; pybind11's per-process type registry raises "already
+    registered" if both are ever imported into the same process (torch sets
+    ``RTLD_GLOBAL``, so the same-named RTTI collides on the second import). Every caller in
+    this module and in ``flashsplat.export`` either replaces ``.renderer`` immediately
+    (``load_model``) or never renders through the freshly constructed model at all
+    (``segment_model``'s checkpoint/PLY export), so the stock tracer is never needed here.
+    """
+
+    def __init__(self, _conf):
+        pass
+
+
+def _patch_stock_tracer() -> None:
+    import threedgut_tracer
+
+    if threedgut_tracer.Tracer is not _UnbuiltTracer:
+        threedgut_tracer.Tracer = _UnbuiltTracer
+
+
+_patch_stock_tracer()
+
+
 def load_model(checkpoint_path: str | Path, config_overrides: dict | None = None):
     """Load a 3DGUT checkpoint and swap in the FlashSplat-instrumented rasterizer.
 
-    ``MixtureOfGaussians.__init__`` builds the stock ``threedgut_tracer.Tracer``; we
-    replace it afterwards. In practice the stock extension is already in the torch
-    extension cache from training, so this costs a cache hit rather than a rebuild.
+    ``MixtureOfGaussians.__init__`` would otherwise unconditionally build the stock
+    ``threedgut_tracer.Tracer`` here, which we discard immediately below -- see
+    ``_UnbuiltTracer`` for why that construction is skipped process-wide.
     """
     from threedgrut.model.model import MixtureOfGaussians
 
@@ -47,6 +73,7 @@ def load_model(checkpoint_path: str | Path, config_overrides: dict | None = None
     model.build_acc()
 
     return model, conf, int(checkpoint["global_step"])
+
 
 
 def build_test_dataloader(conf):
@@ -84,22 +111,33 @@ def accumulate_contributions(
     mask_dir: str | Path,
     num_objects: int,
     on_view=None,
+    return_hit_count: bool = False,
 ) -> torch.Tensor:
     """Render every view with its object-id mask, summing alpha*T per Gaussian per label.
 
     Args:
         on_view: optional ``(index, batch, outputs) -> None`` hook, for saving renders.
+        return_hit_count: also return per-Gaussian count of views with positive contribution.
 
     Returns:
         ``[num_objects + 1, num_gaussians]`` float32 accumulator on the model's device.
     """
     contribution = allocate_accumulator(num_objects, model.num_gaussians)
+    hit_count = torch.zeros(model.num_gaussians, dtype=torch.int32, device=contribution.device)
 
+    num_used = 0
+    num_skipped = 0
     for index, batch in enumerate(dataloader):
+        image_name = str(dataset.image_paths[index])
+        mask_path = find_mask_path_for_frame(mask_dir, image_name)
+        if mask_path is None:
+            # Sparse mask sets only annotate a subset of views; skip the rest.
+            num_skipped += 1
+            continue
+
         gpu_batch = dataset.get_gpu_batch_with_intrinsics(batch)
         height, width = gpu_batch.rays_ori.shape[1:3]
 
-        mask_path = mask_path_for_frame(mask_dir, str(dataset.image_paths[index]))
         object_ids = load_object_id_mask(mask_path, height, width).to(contribution.device)
 
         max_id = int(object_ids.max())
@@ -109,10 +147,18 @@ def accumulate_contributions(
                 f"Ids must lie in 0..{num_objects}."
             )
 
+        previous_contribution = contribution if not return_hit_count else contribution.clone()
         outputs = model.renderer.accumulate_contribution(
             model, gpu_batch, object_ids, contribution, frame_id=index
         )
+        if return_hit_count:
+            hit_count += (contribution > previous_contribution).any(dim=0).to(torch.int32)
+        num_used += 1
         if on_view is not None:
             on_view(index, gpu_batch, outputs)
 
-    return contribution
+    print(f"FlashSplat accumulation: used {num_used} views with masks, skipped {num_skipped} without")
+    if num_used == 0:
+        raise ValueError(f"No masks found in {mask_dir} matching any of the {len(dataset)} views")
+
+    return (contribution, hit_count) if return_hit_count else contribution
