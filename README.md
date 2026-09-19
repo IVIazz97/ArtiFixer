@@ -118,6 +118,12 @@ python -m data_processing.render_flashsplat_extraction \
 
 `scripts/create_reconstructed_split.py SCENE_ROOT` writes the `split.json` that `model_eval.run_inference` consumes for a prepared scene, and `model_eval/compute_metrics_colmap_renders.py` scores renders against the source images.
 
+The pipeline above works with the pinned 3DGRUT submodule. The optional `render_3dgrut_colmap` flags `--render_method threedgrut_flashsplat`, `--object_mask_path_override` and `--flashsplat_*` additionally need the 3DGRUT changes kept in `thirdparty/patches/` (the render method, object-mask loading and a FlashSplat render config). Apply them after `git submodule update`:
+
+```bash
+git -C thirdparty/3DGRUT-ArtiFixer apply ../patches/3DGRUT-ArtiFixer-flashsplat.patch
+```
+
 Download a release checkpoint from the [ArtiFixer Hugging Face repo](https://huggingface.co/nvidia/ArtiFixer). Two variants are available:
 
 | Checkpoint | Base model | Parameters | Notes |
