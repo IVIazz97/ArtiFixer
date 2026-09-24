@@ -239,3 +239,4 @@ slurm-logs/
 *.out
 *.err
 *.png
+/flashsplat/object_id_masks/
