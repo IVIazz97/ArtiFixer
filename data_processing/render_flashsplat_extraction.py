@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -82,6 +83,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Render every Nth dataset view; output filenames retain dataset indices.",
     )
+    parser.add_argument(
+        "--save_opacity",
+        action="store_true",
+        help="Also write grayscale opacity renders to <dirname>_opacity/, in the format "
+        "model_eval.run_inference reads for reconstructed_colmap splits.",
+    )
+    parser.add_argument(
+        "--config_override",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Extra checkpoint config override, repeatable, e.g. selected_indices_file=null.",
+    )
     return parser
 
 
@@ -89,8 +103,8 @@ def main() -> None:
     args = build_parser().parse_args()
     if args.view_stride < 1:
         raise SystemExit("--view_stride must be >= 1")
-        if not 0 < args.convex_hull_trim_percentile <= 100:
-            raise SystemExit("--convex-hull-trim-percentile must be in (0, 100]")
+    if not 0 < args.convex_hull_trim_percentile <= 100:
+        raise SystemExit("--convex-hull-trim-percentile must be in (0, 100]")
     labels = torch.load(args.labels, map_location="cpu")
     if labels.ndim != 2:
         raise SystemExit(f"Expected labels [K+1,N], got {tuple(labels.shape)}")
@@ -108,6 +122,7 @@ def main() -> None:
         config_overrides["dataset.downsample_factor"] = args.downsample_factor
     if args.test_split_interval is not None:
         config_overrides["dataset.test_split_interval"] = args.test_split_interval
+    config_overrides.update(accumulate.parse_config_overrides(args.config_override))
 
     model, conf, global_step = accumulate.load_model(args.checkpoint, config_overrides)
     dataset, dataloader = accumulate.build_test_dataloader(conf)
@@ -195,6 +210,11 @@ def main() -> None:
     background_dir = args.output_root / args.background_dirname
     foreground_dir.mkdir(parents=True, exist_ok=True)
     background_dir.mkdir(parents=True, exist_ok=True)
+    if args.save_opacity:
+        foreground_opacity_dir = args.output_root / f"{args.foreground_dirname}_opacity"
+        background_opacity_dir = args.output_root / f"{args.background_dirname}_opacity"
+        foreground_opacity_dir.mkdir(parents=True, exist_ok=True)
+        background_opacity_dir.mkdir(parents=True, exist_ok=True)
 
     written = 0
     with torch.no_grad():
@@ -202,13 +222,25 @@ def main() -> None:
             if index % args.view_stride != 0:
                 continue
             gpu_batch = dataset.get_gpu_batch_with_intrinsics(batch)
-            foreground = foreground_model(gpu_batch, train=False, frame_id=index)["pred_rgb"][0].clamp(0, 1)
-            background = background_model(gpu_batch, train=False, frame_id=index)["pred_rgb"][0].clamp(0, 1)
+            foreground_outputs = foreground_model(gpu_batch, train=False, frame_id=index)
+            background_outputs = background_model(gpu_batch, train=False, frame_id=index)
+            foreground = foreground_outputs["pred_rgb"][0].clamp(0, 1)
+            background = background_outputs["pred_rgb"][0].clamp(0, 1)
             torchvision.utils.save_image(foreground.permute(2, 0, 1), foreground_dir / f"{index:05d}.png")
             torchvision.utils.save_image(background.permute(2, 0, 1), background_dir / f"{index:05d}.png")
+            if args.save_opacity:
+                for outputs, opacity_dir in (
+                    (foreground_outputs, foreground_opacity_dir),
+                    (background_outputs, background_opacity_dir),
+                ):
+                    opacity = outputs["pred_opacity"][0].clamp(0, 1).permute(2, 0, 1)
+                    torchvision.utils.save_image(opacity, opacity_dir / f"{index:05d}.png")
             written += 1
             if written == 1 or written % 20 == 0 or written == len(dataset):
                 print(f"rendered {written}/{len(dataset)} views", flush=True)
+
+    frame_names = {f"{index:05d}": Path(str(path)).name for index, path in enumerate(dataset.image_paths)}
+    (args.output_root / "frame_names.json").write_text(json.dumps(frame_names, indent=2) + "\n")
 
     print(f"Done. Wrote {written} foreground renders to {foreground_dir}")
     print(f"Done. Wrote {written} background renders to {background_dir}")

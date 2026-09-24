@@ -76,6 +76,23 @@ def load_model(checkpoint_path: str | Path, config_overrides: dict | None = None
 
 
 
+def parse_config_overrides(items: list[str] | None) -> dict:
+    """Parse ``KEY=VALUE`` strings (dotted keys, YAML values) into a ``load_model`` override dict.
+
+    ``selected_indices_file=null`` is the common case: a prepared ArtiFixer checkpoint selects
+    every view for training, which leaves its held-out test split -- the one swept here -- empty.
+    """
+    import yaml
+
+    overrides = {}
+    for item in items or []:
+        key, sep, value = item.partition("=")
+        if not sep or not key:
+            raise ValueError(f"Config override must look like KEY=VALUE, got {item!r}")
+        overrides[key] = yaml.safe_load(value)
+    return overrides
+
+
 def build_test_dataloader(conf):
     """Same test-split dataloader construction as ``threedgrut.render.Renderer``."""
     from threedgrut import datasets

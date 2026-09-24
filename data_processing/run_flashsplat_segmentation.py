@@ -86,6 +86,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override dataset.test_split_interval. The 'test' split is what gets swept for "
         "accumulation, so pass <= 0 to use every view instead of the default 1-in-N holdout.",
     )
+    parser.add_argument(
+        "--config_override",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Extra checkpoint config override, repeatable, e.g. selected_indices_file=null.",
+    )
     return parser
 
 
@@ -104,6 +111,7 @@ def main() -> None:
         config_overrides["dataset.downsample_factor"] = args.downsample_factor
     if args.test_split_interval is not None:
         config_overrides["dataset.test_split_interval"] = args.test_split_interval
+    config_overrides.update(accumulate.parse_config_overrides(args.config_override))
 
     model, conf, global_step = accumulate.load_model(args.checkpoint, config_overrides)
     dataset, dataloader = accumulate.build_test_dataloader(conf)
