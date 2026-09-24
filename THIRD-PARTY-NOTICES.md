@@ -121,6 +121,18 @@ See `flashsplat/threedgut_flashsplat_tracer/README.md` for the exact set of chan
 implementation. The rasterizer hook implements the same per-Gaussian, per-label
 accumulation of `alpha * transmittance` that FlashSplat adds to the 3DGS rasterizer.
 
+## Inpaint360GS
+
+- Path: `inpaint360gs/`
+- Source: "Inpaint360GS: Efficient Object-Aware 3D Inpainting via Gaussian Splatting for 360°
+  Scenes" (WACV 2026), https://github.com/dfki-av/Inpaint360GS @ d54c893
+- License: Apache-2.0
+
+`inpaint360gs/` ports the official pipeline (mask association, identity distillation, object
+removal, virtual camera poses, LaMa inpainting setup, Gaussian initialisation and inpainting
+finetune) onto 3DGUT. `inpaint360gs/lama.py` also ports LaMa's feature refinement
+(`saicinpainting/evaluation/refinement.py`, https://github.com/advimman/lama, Apache-2.0).
+
 ## 3DGRUT
 
 - Path: `thirdparty/3DGRUT-ArtiFixer`
