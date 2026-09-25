@@ -8,12 +8,23 @@
 #              bighull  hole = 2D convex hull of that, dilated 80 px; "empty floor" caption
 #   Both variants give ArtiFixer the object-free background renders as reference views, never the
 #   photos, so nothing it is conditioned on shows the object.
+#              vanilla  no removal, no FlashSplat, no masks (TA_BLUE_MOTOR, PCV): plain ArtiFixer3D+
+#                       on a novel camera path; see "Vanilla" below. run_vanilla.sh runs both scenes.
 #
 # Part 1 (default): prep, flashsplat, derive, split, infer. Ends with a single-rollout ArtiFixer
 # video; look at it and note frames where the hole is filled cleanly. Then part 2:
 #   SEEDS=0-6 bash scripts/bakerh/run_removal.sh SCENE VARIANT      -> propagate, af3d, af3dplus
 #   SEEDS=auto   seeds = the first 7 frames of each frame window (also runs part 1 if missing)
 # PHASES=split,infer reruns only those phases. FORCE=1 redoes prep and flashsplat even when done.
+#
+# Vanilla (phases vprep, vinfer, vaf3d, vaf3dplus): make_trajectory.py builds a smooth path, one
+# camera per photo, weaving TRAJ_SIDE (2) median photo spacings to either side of the photo path
+# (across the direction of travel) and TRAJ_UP (0.5) spacings above it. vprep renders it with the
+# existing 3DGUT model into a prepared root (every photo is a real anchor, every path frame a
+# target; caption and metric scale reused from the scene), vinfer fixes the path renders with the
+# photos as references, vaf3d distills photos + fixed frames into a new 3DGUT, vaf3dplus runs
+# ArtiFixer again on its path renders.
+# FORCE=1 redoes vprep and vinfer even when done.
 #
 # Env knobs: GPU (1), NUM_VIEWS (6), DILATE, HOLE_SHAPE, FRAMES, MASK_DIR, SCENE_CAPTION,
 # EMPTY_CAPTION, METRIC_SCALE, OUTSIDE (photo|render), AF3D_STEPS (30000), PY, SCENE_ROOT, FS_SRC, OUT_ROOT.
@@ -75,8 +86,13 @@ esac
 case $VARIANT in
   normal)  HOLE_SHAPE=${HOLE_SHAPE:-mask}; DILATE=${DILATE:-12} ;;
   bighull) HOLE_SHAPE=${HOLE_SHAPE:-hull}; DILATE=${DILATE:-80} ;;
-  *) echo "unknown VARIANT '$VARIANT' (normal, bighull)" >&2; exit 2 ;;
+  vanilla) HOLE_SHAPE=none; DILATE=0
+    # One path frame per photo: all 923 Compressor photos would not fit through ArtiFixer.
+    [ "$S" != Compressor ] || { echo "vanilla is for TA_BLUE_MOTOR and PCV only" >&2; exit 2; } ;;
+  *) echo "unknown VARIANT '$VARIANT' (normal, bighull, vanilla)" >&2; exit 2 ;;
 esac
+TRAJ_SIDE=${TRAJ_SIDE:-2}
+TRAJ_UP=${TRAJ_UP:-0.5}
 if [ -z "${MASK_DIR:-}" ]; then
   for d in "$SAM_MASKS/$S/full/masks_npy" "$SAM_MASKS/$S/0_400/masks_npy"; do
     if [ -d "$d" ]; then MASK_DIR=$d; break; fi
@@ -87,13 +103,16 @@ COLMAP=$SR/3dgrut_input/$S
 OUT_ROOT=${OUT_ROOT:-$AF/output/bakerh_removal}
 FS=$OUT_ROOT/$S/flashsplat      # shared by both variants
 O=$OUT_ROOT/$S/$VARIANT
+V=$O/$S                         # vanilla: prepared root (its name is the scene id)
 
 pred_dir() {  # newest single-rollout prediction dir under $1 (empty if none)
   [ -d "$1" ] || return 0
   find "$1" -type d -path '*/frames/batch_0000/pred' -printf '%T@ %p\n' | sort -nr | awk 'NR == 1 { sub(/^[^ ]+ /, ""); print }'
 }
 
-if [ -z "${PHASES:-}" ]; then
+if [ -z "${PHASES:-}" ] && [ "$VARIANT" = vanilla ]; then
+  PHASES=vprep,vinfer,vaf3d,vaf3dplus
+elif [ -z "${PHASES:-}" ]; then
   PHASES=prep,flashsplat,derive,split,infer
   if [ -n "${SEEDS:-}" ]; then
     if [ -n "$(pred_dir "$O/artifixer")" ]; then PHASES=propagate,af3d,af3dplus
@@ -111,7 +130,9 @@ N=0
 note() { echo "[$(date '+%F %T')] $S/$VARIANT $*" | tee -a "$SUMMARY" "$LOG_DIR/summary.log"; }
 
 missing=()
-for f in "$PY" "$CKPT" "$CHECKPOINT_PT" "$MODEL_ID" "$COLMAP" "${MASK_DIR:-<MASK_DIR: no masks_npy under $SAM_MASKS/$S>}"; do
+needed=("$PY" "$CKPT" "$CHECKPOINT_PT" "$MODEL_ID" "$COLMAP")
+[ "$VARIANT" = vanilla ] || needed+=("${MASK_DIR:-<MASK_DIR: no masks_npy under $SAM_MASKS/$S>}")
+for f in "${needed[@]}"; do
   [ -e "$f" ] || missing+=("$f")
 done
 if [ ${#missing[@]} -gt 0 ]; then
@@ -263,9 +284,74 @@ phase_af3dplus() {
       --neighbor_selection_mode covisibility --num_views "$NUM_VIEWS" "${MEM_ARGS[@]}" --replace_if_exists
 }
 
+phase_vprep() {
+  # Prepared root $V with the photos as anchors and the novel path as targets, rendered from the
+  # existing 3DGUT checkpoint (no reconstruction). Caption and metric scale come from the scene.
+  if [ -z "${FORCE:-}" ] && [ -f "$V/split.json" ]; then
+    echo "found $V/split.json"
+    return
+  fi
+  local prep=("$PY" -m data_processing.prepare_colmap_artifixer_inputs --colmap_dir "$COLMAP" --output_root "$V"
+              --reconstruction_checkpoint "$CKPT" ${FORCE:+--replace})
+  "${prep[@]}" --phases prepare
+  "$PY" scripts/bakerh/make_trajectory.py --transforms "$V/3dgrut_input/$S/nerfstudio/transforms.json" \
+      --output "$O/trajectory_input.json" --side "$TRAJ_SIDE" --up "$TRAJ_UP"
+
+  local caption=$V/captions/$S/caption.h5 src=""
+  if [ -f "$SR/split.json" ]; then
+    src=$("$PY" -c 'import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+entry = next(iter(json.loads((root / "split.json").read_text())["test"].values()))
+print((root / entry["prompt_path"]).resolve())' "$SR")
+  fi
+  mkdir -p "$(dirname "$caption")"
+  if [ -n "$src" ] && [ -f "$src" ]; then
+    echo "caption from $src"
+    cp -L "$src" "$caption"
+  else
+    echo "caption: $SCENE_CAPTION"
+    "$PY" output/jobs/write_caption.py --caption "$SCENE_CAPTION" --output_path "$caption" --text_encoder_model_id "$MODEL_ID"
+  fi
+
+  local scale
+  scale=$(sed -n 's/^Scale factor: *\([^ ]*\).*/\1/p' "$SR/metric_alignment/scale_info.txt" 2>/dev/null | head -1)
+  echo "metric scale: ${scale:-<none in $SR/metric_alignment: estimating with MoGe>}"
+  "${prep[@]}" --phases render,scale --trajectory_path "$O/trajectory_input.json" ${scale:+--metric_scale "$scale"}
+  [ -f "$V/split.json" ] || { echo "prepare wrote no $V/split.json (trajectory renders incomplete?)"; return 1; }
+}
+
+phase_vinfer() {
+  # ArtiFixer on the path renders, photos as reference views (upstream default neighbour selection).
+  if [ -z "${FORCE:-}" ] && [ -n "$(pred_dir "$O/artifixer")" ]; then
+    echo "found $(pred_dir "$O/artifixer")"
+    return
+  fi
+  "$PY" -m model_eval.run_inference --evalset reconstructed_colmap \
+      --checkpoint_pt "$CHECKPOINT_PT" --model_id "$MODEL_ID" \
+      --save_dir "$O/artifixer" --split_path "$V/split.json" --render_trajectory trajectory \
+      --num_views "$NUM_VIEWS" "${MEM_ARGS[@]}" --replace_if_exists
+}
+
+phase_vaf3d() {
+  local pred
+  pred=$(pred_dir "$O/artifixer")
+  [ -n "$pred" ] || { echo "no ArtiFixer output under $O/artifixer: run vinfer first"; return 1; }
+  echo "ArtiFixer frames: $pred"
+  "$PY" -m data_processing.run_artifixer3d --scene_root "$V" --artifixer_frames_dir "$pred" \
+      --artifixer3d_steps "$AF3D_STEPS"
+}
+
+phase_vaf3dplus() {
+  "$PY" -m model_eval.run_inference --evalset reconstructed_colmap \
+      --checkpoint_pt "$CHECKPOINT_PT" --model_id "$MODEL_ID" \
+      --save_dir "$O/af3d_plus" --split_path "$V/split_artifixer3d_plus.json" --render_trajectory trajectory \
+      --num_views "$NUM_VIEWS" "${MEM_ARGS[@]}" --replace_if_exists
+}
+
 {
   echo "scene=$S variant=$VARIANT phases=$PHASES seeds=${SEEDS:-} gpu=$GPU"
-  echo "scene_root=$SR"; echo "flashsplat_src=$FS_SRC"; echo "flashsplat_out=$FS"; echo "masks=$MASK_DIR"
+  echo "scene_root=$SR"; echo "flashsplat_src=$FS_SRC"; echo "flashsplat_out=$FS"; echo "masks=${MASK_DIR:-}"
+  echo "vanilla path: side=$TRAJ_SIDE up=$TRAJ_UP spacings (used by vprep only)"
   echo "frames=${FRAMES:-all} hole=$HOLE_SHAPE+${DILATE}px refs=render outside=$OUTSIDE num_views=$NUM_VIEWS"
   echo "scene_caption=$SCENE_CAPTION"; echo "empty_caption=$EMPTY_CAPTION"
   echo "python=$PY venv=${VIRTUAL_ENV:-<not active>}"; echo "model_id=$MODEL_ID"; echo "checkpoint=$CHECKPOINT_PT"
@@ -299,5 +385,12 @@ if [[ ",$PHASES," == *,af3dplus,* ]]; then
   echo "ArtiFixer3D renders:  $(find "$O/af3d/artifixer3d" -type d -name renders 2>/dev/null | head -1)"
   echo "ArtiFixer3D+ output:"
   find "$O/af3d_plus" -name '*.mp4' | head -5
+fi
+if [[ ",$PHASES," == *,vaf3dplus,* ]]; then
+  echo
+  echo "3DGUT path renders:   $V/recon_results/$S/reconstruction/$S/ours_10000/trajectory/renders"
+  echo "ArtiFixer output:"; find "$O/artifixer" -name '*.mp4' | head -5
+  echo "ArtiFixer3D renders:  $(find "$V/artifixer3d" -type d -name renders 2>/dev/null | head -1)"
+  echo "ArtiFixer3D+ output:"; find "$O/af3d_plus" -name '*.mp4' | head -5
 fi
 exit 0
