@@ -39,7 +39,11 @@ debug/
 .installed.cfg
 *.egg
 MANIFEST
-output
+
+# Run outputs stay local, but the job scripts and the layout doc are code
+/output/*
+!/output/jobs
+!/output/LAYOUT.md
 
 # PyInstaller
 #   Usually these files are written by a python script from a template
