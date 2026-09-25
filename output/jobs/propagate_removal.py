@@ -49,6 +49,8 @@ parser.add_argument("--outside", choices=("photo", "render"), default="photo",
 parser.add_argument("--keep_rounds", action="store_true")
 parser.add_argument("--checkpoint_pt", required=True)
 parser.add_argument("--model_id", required=True)
+parser.add_argument("--max_neighbors_per_encode", type=int, default=None,
+                    help="Passed to run_inference; 1 VAE-encodes one reference at a time (low memory).")
 args = parser.parse_args()
 
 split = json.loads((args.scene_root / "split.json").read_text())["test"]
@@ -118,6 +120,7 @@ run_args = parse_args([
     "--evalset", "reconstructed_colmap", "--checkpoint_pt", args.checkpoint_pt, "--model_id", args.model_id,
     "--save_dir", str(out / "unused"), "--split_path", str(out / "unused.json"),
     "--render_trajectory", "trajectory", "--neighbor_selection_mode", "covisibility", "--save_frame_outputs_only",
+    *(["--max_neighbors_per_encode", str(args.max_neighbors_per_encode)] if args.max_neighbors_per_encode else []),
 ])
 device = torch.device("cuda:0")
 with torch.inference_mode():

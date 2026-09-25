@@ -20,6 +20,7 @@ from PIL import Image
 from PIL import ImageDraw
 from scipy.ndimage import binary_dilation
 from scipy.spatial import ConvexHull
+from scipy.spatial import QhullError
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--scene_root", type=Path, required=True)
@@ -68,12 +69,17 @@ for i, frame in enumerate(frames):
     if sam.shape != (h, w):
         sam = np.asarray(Image.fromarray(sam).resize((w, h), Image.NEAREST))
     hole = (sam > 0) | (foreground_opacity / 255.0 > args.fg_opacity_threshold)
-    if args.hole_shape == "hull":
+    if args.hole_shape == "hull" and np.count_nonzero(hole) >= 3:
         ys, xs = np.nonzero(hole)
         points = np.stack([xs, ys], 1)
-        polygon = Image.new("L", (w, h), 0)
-        ImageDraw.Draw(polygon).polygon([tuple(p) for p in points[ConvexHull(points).vertices]], fill=1)
-        hole = np.asarray(polygon, dtype=bool)
+        try:
+            vertices = points[ConvexHull(points).vertices]
+        except QhullError:  # collinear footprint (object at the image border): keep the mask
+            vertices = None
+        if vertices is not None:
+            polygon = Image.new("L", (w, h), 0)
+            ImageDraw.Draw(polygon).polygon([tuple(p) for p in vertices], fill=1)
+            hole = np.asarray(polygon, dtype=bool)
     hole = binary_dilation(hole, iterations=args.dilate_px)
     hole_fractions.append(hole.mean())
 
