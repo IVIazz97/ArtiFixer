@@ -33,7 +33,20 @@ export PYTHONPATH="$AF:$AF/thirdparty/3DGRUT-ArtiFixer:${PYTHONPATH:-}"
 if [ -z "${CUDA_HOME:-}" ] && [ -d /usr/local/cuda-12.8 ]; then
   export CUDA_HOME=/usr/local/cuda-12.8 PATH=/usr/local/cuda-12.8/bin:$PATH
 fi
-PY=${PY:-$AF/.venv/bin/python}
+# Activate the repo venv: its bin/ must be on PATH (ninja for the 3DGUT CUDA JIT build).
+VENV=${VENV:-$AF/.venv}
+if [ -f "$VENV/bin/activate" ]; then
+  set +u; source "$VENV/bin/activate"; set -u
+fi
+PY=${PY:-$VENV/bin/python}
+# torch's JIT build shells out to `ninja`; if the venv lacks it, install the ninja wheel into it.
+if ! command -v ninja >/dev/null 2>&1; then
+  echo "ninja not on PATH: installing the ninja wheel with $PY" >&2
+  "$PY" -m pip install -q ninja || { command -v uv >/dev/null 2>&1 && uv pip install --python "$PY" ninja; } || true
+  NINJA_BIN=$("$PY" -c 'import ninja; print(ninja.BIN_DIR)' 2>/dev/null || true)
+  if [ -n "$NINJA_BIN" ]; then export PATH="$NINJA_BIN:$PATH"; fi
+  command -v ninja >/dev/null 2>&1 || { echo "ninja still missing: run '$PY -m pip install ninja', then rerun" >&2; exit 3; }
+fi
 MODEL_ID=${MODEL_ID:-$AF/checkpoints/Wan2.1-T2V-1.3B-Diffusers}
 CHECKPOINT_PT=${CHECKPOINT_PT:-$AF/checkpoints/ArtiFixer/artifixer-1.3b.pt}
 NUM_VIEWS=${NUM_VIEWS:-6}
@@ -255,7 +268,8 @@ phase_af3dplus() {
   echo "scene_root=$SR"; echo "flashsplat_src=$FS_SRC"; echo "flashsplat_out=$FS"; echo "masks=$MASK_DIR"
   echo "frames=${FRAMES:-all} hole=$HOLE_SHAPE+${DILATE}px refs=render outside=$OUTSIDE num_views=$NUM_VIEWS"
   echo "scene_caption=$SCENE_CAPTION"; echo "empty_caption=$EMPTY_CAPTION"
-  echo "python=$PY"; echo "model_id=$MODEL_ID"; echo "checkpoint=$CHECKPOINT_PT"
+  echo "python=$PY venv=${VIRTUAL_ENV:-<not active>}"; echo "model_id=$MODEL_ID"; echo "checkpoint=$CHECKPOINT_PT"
+  echo "on PATH: python=$(command -v python) ninja=$(command -v ninja) nvcc=$(command -v nvcc) CUDA_HOME=${CUDA_HOME:-}"
   echo "git=$(git rev-parse --short HEAD 2>/dev/null) $(git status --porcelain 2>/dev/null | wc -l) changed files"
   nvidia-smi -i "$GPU" 2>&1 | head -20 || true
 } > "$LOG_DIR/00_config.log"

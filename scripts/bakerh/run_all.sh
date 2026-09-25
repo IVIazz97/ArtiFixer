@@ -28,7 +28,11 @@ cd "$AF"
 export GPU=${GPU:-1}
 export SEEDS=${SEEDS:-auto}
 export OUT_ROOT=${OUT_ROOT:-$AF/output/bakerh_removal}
-PY=${PY:-$AF/.venv/bin/python}
+VENV=${VENV:-$AF/.venv}
+if [ -f "$VENV/bin/activate" ]; then
+  set +u; source "$VENV/bin/activate"; set -u
+fi
+PY=${PY:-$VENV/bin/python}
 JOBS=${JOBS:-"TA_BLUE_MOTOR:normal PCV:normal TA_BLUE_MOTOR:bighull PCV:bighull Compressor:bighull"}
 
 LATEST=$OUT_ROOT/logs/latest
@@ -81,6 +85,10 @@ section "GPU"
 nvidia-smi >> "$REPORT" 2>&1 || echo "nvidia-smi failed" >> "$REPORT"
 
 section "python"
+{
+  echo "venv: ${VIRTUAL_ENV:-<not active: $VENV/bin/activate missing>}"
+  echo "on PATH: python=$(command -v python) ninja=$(command -v ninja) nvcc=$(command -v nvcc)"
+} >> "$REPORT"
 CUDA_VISIBLE_DEVICES=$GPU PYTHONPATH="$AF:$AF/thirdparty/3DGRUT-ArtiFixer" timeout 600 "$PY" - >> "$REPORT" 2>&1 <<'EOF'
 import importlib.util, sys
 from importlib import metadata
