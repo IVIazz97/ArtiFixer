@@ -3,10 +3,12 @@
 #   TA_BLUE_MOTOR normal, PCV normal, TA_BLUE_MOTOR bighull, PCV bighull, Compressor bighull
 # (run_removal.sh does each job; its header documents the phases and knobs.)
 #
-# Usage, from the repo root:
-#   bash scripts/bakerh/run_all.sh
+# Usage (from any directory):
+#   bash scripts/bakerh/run_all.sh        starts in the background, keeps running after you log
+#                                         out, prints the commands to follow and stop it
+#   bash scripts/bakerh/run_all.sh --fg   runs in this terminal instead
 #
-# Everything is logged under output/bakerh_removal/logs/<timestamp>/:
+# Everything is logged under output/bakerh_removal/logs/<timestamp>/ (also .../logs/latest/):
 #   all.log     full console output of every job and phase
 #   REPORT.txt  environment, inputs found/missing, status + duration of each job, per-phase
 #               durations and peak GPU memory, and the last 80 lines of every failed phase.
@@ -29,11 +31,33 @@ export OUT_ROOT=${OUT_ROOT:-$AF/output/bakerh_removal}
 PY=${PY:-$AF/.venv/bin/python}
 JOBS=${JOBS:-"TA_BLUE_MOTOR:normal PCV:normal TA_BLUE_MOTOR:bighull PCV:bighull Compressor:bighull"}
 
-STAMP=$(date +%Y%m%d_%H%M%S)
+LATEST=$OUT_ROOT/logs/latest
+if [ -z "${BAKERH_CHILD:-}" ] && [ -f "$LATEST/pgid" ] && kill -0 -- "-$(cat "$LATEST/pgid")" 2>/dev/null; then
+  echo "a run is already going (log: $LATEST/all.log). Stop it first: kill -- -$(cat "$LATEST/pgid")"
+  exit 1
+fi
+
+STAMP=${BAKERH_STAMP:-$(date +%Y%m%d_%H%M%S)}
 RUN_DIR=$OUT_ROOT/logs/$STAMP
 mkdir -p "$RUN_DIR"
-ln -sfn "$STAMP" "$OUT_ROOT/logs/latest"
-exec > >(tee -a "$RUN_DIR/all.log") 2>&1
+ln -sfn "$STAMP" "$LATEST"
+
+if [ -z "${BAKERH_CHILD:-}" ] && [ "${1:-}" != "--fg" ]; then
+  # Relaunch detached (own session, immune to hangup) with all output going to all.log.
+  launcher=(nohup); command -v setsid > /dev/null && launcher=(setsid nohup)
+  BAKERH_CHILD=1 BAKERH_STAMP=$STAMP "${launcher[@]}" bash "$HERE/run_all.sh" >> "$RUN_DIR/all.log" 2>&1 < /dev/null &
+  sleep 3
+  echo "Started in the background; it keeps running if you close this terminal."
+  echo "  follow:  tail -f $LATEST/all.log"
+  echo "  report:  $LATEST/REPORT.txt   (send this back if something fails)"
+  echo "  stop:    kill -- -\$(cat $LATEST/pgid)"
+  exit 0
+fi
+if [ -n "${BAKERH_CHILD:-}" ]; then
+  ps -o pgid= -p $$ | tr -d ' ' > "$RUN_DIR/pgid"   # kill -- -<pgid> stops this run and its python jobs
+else
+  exec > >(tee -a "$RUN_DIR/all.log") 2>&1
+fi
 REPORT=$RUN_DIR/REPORT.txt
 log() { echo "[$(date '+%F %T')] $*"; }
 section() { printf '\n==================== %s ====================\n' "$*" >> "$REPORT"; }
