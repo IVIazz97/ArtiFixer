@@ -10,7 +10,9 @@ metric_scale. This writes such a split.json into --output_dir, with three option
   --prompt_path  use another caption.h5 (e.g. the "empty floor" prompt) for every later stage
   resolution     when the photos are larger than the 3DGUT renders (scene trained on downsampled
                  images), write the photos resized to the render size and scale the intrinsics,
-                 so photos, renders, hole masks and ArtiFixer outputs all share one size
+                 so photos, renders, hole masks and ArtiFixer outputs all share one size.
+                 --render_like names the render to match (the FlashSplat background render, which
+                 is what ArtiFixer gets); without it, the scene's reconstruction render is used
 
 Writes to --output_dir:
   split.json        {"test": {scene_id: {...}}} with absolute paths
@@ -31,6 +33,7 @@ parser.add_argument("--output_dir", type=Path, required=True)
 parser.add_argument("--frames", default="", help="e.g. '49-148,284-304'; empty keeps every frame.")
 parser.add_argument("--prompt_path", type=Path, default=None)
 parser.add_argument("--seed_length", type=int, default=7, help="Frames per auto seed range (one per window).")
+parser.add_argument("--render_like", type=Path, default=None, help="Match the photos to this render's size.")
 args = parser.parse_args()
 
 split = json.loads((args.scene_root / "split.json").read_text())["test"]
@@ -60,7 +63,10 @@ subset = [dict(frames[i]) for i in indices]
 with Image.open(image_root / subset[0]["file_path"]) as photo:
     photo_size = photo.size
 render_size = photo_size
-if "render_dir" in entry:
+if args.render_like is not None:
+    with Image.open(args.render_like) as render:
+        render_size = render.size
+elif "render_dir" in entry:
     first_render = (root / entry["render_dir"]) / f"{indices[0]:05d}.png"
     if first_render.is_file():
         with Image.open(first_render) as render:

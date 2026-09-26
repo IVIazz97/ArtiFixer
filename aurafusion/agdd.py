@@ -179,8 +179,10 @@ def main() -> None:
         reference = np.asarray(Image.open(args.reference_image).convert("RGB").resize(removed.shape[1::-1], Image.BICUBIC))
         composite = reference
     else:
-        photo = np.asarray(Image.open(args.colmap_dir / "images" / camera["name"]).convert("RGB"))
-        assert photo.shape == removed.shape, f"photo {photo.shape} vs render {removed.shape}"
+        photo = Image.open(args.colmap_dir / "images" / camera["name"]).convert("RGB")
+        if photo.size != removed.shape[1::-1]:  # scene trained on downsampled photos
+            photo = photo.resize(removed.shape[1::-1], Image.LANCZOS)
+        photo = np.asarray(photo)
         obj = torch.from_numpy(np.asarray(Image.open(root / "object" / "opacity" / f"{r:05d}.png"), dtype=np.float32) / 255.0)
         obj = dilate((obj > args.object_threshold).float()[None, None], args.object_dilate, 3)[0, 0].numpy() > 0.5
         composite = np.where(obj[..., None], removed, photo)
@@ -191,7 +193,11 @@ def main() -> None:
     # 2. AGDD depth for the reference, guided by the removed-scene depth outside the unseen mask.
     from diffusers import DDPMScheduler, MarigoldDepthPipeline
 
-    pipe = MarigoldDepthPipeline.from_pretrained(args.marigold, variant="fp16", torch_dtype=torch.float16).to("cuda")
+    try:
+        pipe = MarigoldDepthPipeline.from_pretrained(args.marigold, variant="fp16", torch_dtype=torch.float16)
+    except (OSError, ValueError):  # a local copy without the *.fp16.safetensors files
+        pipe = MarigoldDepthPipeline.from_pretrained(args.marigold, torch_dtype=torch.float16)
+    pipe = pipe.to("cuda")
     pipe.scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
     depth = torch.from_numpy(np.load(root / "removed" / "depth" / f"{r:05d}.npy")).cuda()[None]  # [1, H, W]
     mask = torch.from_numpy(unseen).cuda().float()[None]  # [1, H, W]

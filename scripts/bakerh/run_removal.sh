@@ -10,6 +10,10 @@
 #   photos, so nothing it is conditioned on shows the object.
 #              vanilla  no removal, no FlashSplat, no masks (TA_BLUE_MOTOR, PCV): plain ArtiFixer3D+
 #                       on a novel camera path; see "Vanilla" below. run_vanilla.sh runs both scenes.
+#              i360     Inpaint360GS 3DGUT port (inpaint360gs/): FlashSplat removal, virtual views, LaMa
+#              af360    AuraFusion360 3DGUT port (aurafusion/): SAM2 unseen masks, Marigold AGDD,
+#                       LeftRefill SDEdit. Both need setup_baselines.sh once; see "Baselines" below.
+#                       run_baselines.sh runs both on all three scenes.
 #
 # Part 1 (default): prep, flashsplat, derive, split, infer. Ends with a single-rollout ArtiFixer
 # video; look at it and note frames where the hole is filled cleanly. Then part 2:
@@ -26,13 +30,21 @@
 # ArtiFixer again on its path renders.
 # FORCE=1 redoes vprep and vinfer even when done.
 #
-# Env knobs: GPU (1), NUM_VIEWS (6), DILATE, HOLE_SHAPE, FRAMES, MASK_DIR, SCENE_CAPTION,
-# EMPTY_CAPTION, METRIC_SCALE, OUTSIDE (photo|render), AF3D_STEPS (30000), PY, SCENE_ROOT, FS_SRC, OUT_ROOT.
+# Baselines (i360, af360): both remove the same FlashSplat object as the ArtiFixer runs (labels,
+# contribution and hit count from FS_SRC, else from the flashsplat phase). With FRAMES they run on
+# those views only (subset_colmap.py; the Compressor defaults to COMPRESSOR_FRAMES, else
+# 49-148,284-304, the ArtiFixer frames). af360's reference view is the one with the largest unseen
+# mask (REF_INDEX overrides). Models come from the local folders in MODELS (no Hugging Face); the
+# af360 2D stages run in .venv_af2d. Final renders of every view: <variant>/final/rgb.
+#
+# Env knobs: GPU (1), NUM_VIEWS (6), DILATE, HOLE_SHAPE, FRAMES, COMPRESSOR_FRAMES, MASK_DIR, SCENE_CAPTION,
+# EMPTY_CAPTION, METRIC_SCALE, OUTSIDE (photo|render), AF3D_STEPS (30000), PY, SCENE_ROOT, FS_SRC, OUT_ROOT,
+# MODELS, REF_INDEX.
 # Outputs: output/bakerh_removal/<scene>/<variant>/. Logs: .../logs/<timestamp>/NN_<phase>.log and
 # .../logs/summary.log (start, end, duration and peak GPU memory of every phase, across runs).
 set -euo pipefail
-SCENE=${1:?usage: run_removal.sh SCENE VARIANT   (SCENE: TA_BLUE_MOTOR|PCV|Compressor, VARIANT: normal|bighull)}
-VARIANT=${2:?usage: run_removal.sh SCENE VARIANT   (VARIANT: normal|bighull)}
+SCENE=${1:?usage: run_removal.sh SCENE VARIANT   (SCENE: TA_BLUE_MOTOR|PCV|Compressor, VARIANT: normal|bighull|vanilla|i360|af360)}
+VARIANT=${2:?usage: run_removal.sh SCENE VARIANT   (VARIANT: normal|bighull|vanilla|i360|af360)}
 AF=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$AF"
 
@@ -79,7 +91,7 @@ case $S in
     # The ds2 scene already has split.json, caption, metric scale and the tuned FlashSplat labels.
     # Only frames 49-148 and 284-304 go through ArtiFixer: all 923 at once ran out of memory.
     SR=${SCENE_ROOT:-$AF/output/bakerh_undis_ds2_from1600/$S}
-    FS_SRC=${FS_SRC:-$SR/flashsplat_out_per_view_norm_gt0p1_hull_trim995}; FRAMES=${FRAMES-49-148,284-304}
+    FS_SRC=${FS_SRC:-$SR/flashsplat_out_per_view_norm_gt0p1_hull_trim995}; FRAMES=${FRAMES-${COMPRESSOR_FRAMES-49-148,284-304}}
     SCENE_CAPTION=${SCENE_CAPTION:-} ;;
   *) echo "unknown SCENE '$S' (TA_BLUE_MOTOR, PCV, Compressor)" >&2; exit 2 ;;
 esac
@@ -89,10 +101,18 @@ case $VARIANT in
   vanilla) HOLE_SHAPE=none; DILATE=0
     # One path frame per photo: all 923 Compressor photos would not fit through ArtiFixer.
     [ "$S" != Compressor ] || { echo "vanilla is for TA_BLUE_MOTOR and PCV only" >&2; exit 2; } ;;
-  *) echo "unknown VARIANT '$VARIANT' (normal, bighull, vanilla)" >&2; exit 2 ;;
+  i360|af360) HOLE_SHAPE=none; DILATE=0; export HF_HUB_OFFLINE=1 ;;
+  *) echo "unknown VARIANT '$VARIANT' (normal, bighull, vanilla, i360, af360)" >&2; exit 2 ;;
 esac
 TRAJ_SIDE=${TRAJ_SIDE:-2}
 TRAJ_UP=${TRAJ_UP:-0.5}
+# Baselines: local model folders (no Hugging Face on the VM) and the AuraFusion360 2D-model venv.
+MODELS=${MODELS:-/workspace/amazzucchelli/fbk-3dworld/models}
+LAMA=${LAMA:-$MODELS/LaMa/big-lama.pt}
+MARIGOLD=${MARIGOLD:-$MODELS/marigold-depth-v1-0}
+SD2_CKPT=${SD2_CKPT:-$MODELS/stable-diffusion-2-inpainting/512-inpainting-ema.ckpt}
+AF360_REPO=${AF360_REPO:-/workspace/amazzucchelli/fbk-3dworld/AuraFusion360_official}
+AF_PY=${AF_PY:-$AF/.venv_af2d/bin/python}
 if [ -z "${MASK_DIR:-}" ]; then
   for d in "$SAM_MASKS/$S/full/masks_npy" "$SAM_MASKS/$S/0_400/masks_npy"; do
     if [ -d "$d" ]; then MASK_DIR=$d; break; fi
@@ -104,6 +124,9 @@ OUT_ROOT=${OUT_ROOT:-$AF/output/bakerh_removal}
 FS=$OUT_ROOT/$S/flashsplat      # shared by both variants
 O=$OUT_ROOT/$S/$VARIANT
 V=$O/$S                         # vanilla: prepared root (its name is the scene id)
+# Baselines: FlashSplat dir with labels, contribution and hit count; the COLMAP views they run on.
+if [ -f "$FS_SRC/hit_count.pt" ]; then FSP=$FS_SRC; else FSP=$FS; fi
+if [ -n "${FRAMES:-}" ]; then PCOLMAP=$O/colmap; else PCOLMAP=$COLMAP; fi
 
 pred_dir() {  # newest single-rollout prediction dir under $1 (empty if none)
   [ -d "$1" ] || return 0
@@ -112,6 +135,10 @@ pred_dir() {  # newest single-rollout prediction dir under $1 (empty if none)
 
 if [ -z "${PHASES:-}" ] && [ "$VARIANT" = vanilla ]; then
   PHASES=vprep,vinfer,vaf3d,vaf3dplus
+elif [ -z "${PHASES:-}" ] && [ "$VARIANT" = i360 ]; then
+  PHASES=flashsplat,views,i360remove,i360virtual,i360nbs,i360lama,i360init,i360finetune
+elif [ -z "${PHASES:-}" ] && [ "$VARIANT" = af360 ]; then
+  PHASES=flashsplat,views,afrender,afcontour,afsam2,afagdd,afinit,afsdedit,affinetune
 elif [ -z "${PHASES:-}" ]; then
   PHASES=prep,flashsplat,derive,split,infer
   if [ -n "${SEEDS:-}" ]; then
@@ -132,6 +159,10 @@ note() { echo "[$(date '+%F %T')] $S/$VARIANT $*" | tee -a "$SUMMARY" "$LOG_DIR/
 missing=()
 needed=("$PY" "$CKPT" "$CHECKPOINT_PT" "$MODEL_ID" "$COLMAP")
 [ "$VARIANT" = vanilla ] || needed+=("${MASK_DIR:-<MASK_DIR: no masks_npy under $SAM_MASKS/$S>}")
+case $VARIANT in
+  i360)  needed+=("$LAMA") ;;
+  af360) needed+=("$LAMA" "$MARIGOLD" "$SD2_CKPT" "$AF360_REPO/utils/LeftRefill" "$AF_PY") ;;
+esac
 for f in "${needed[@]}"; do
   [ -e "$f" ] || missing+=("$f")
 done
@@ -235,8 +266,9 @@ phase_derive() {
     prompt_args=(--prompt_path "$O/prompt/caption.h5")
   fi
   rm -rf "$O/scene"
+  # Size the photos like the FlashSplat renders (half size for the Compressor, trained downsampled).
   "$PY" scripts/bakerh/derive_scene.py --scene_root "$SR" --output_dir "$O/scene" --frames "$FRAMES" \
-      ${prompt_args[@]+"${prompt_args[@]}"}
+      --render_like "$FS/background_renders/00000.png" ${prompt_args[@]+"${prompt_args[@]}"}
 }
 
 phase_split() {
@@ -292,7 +324,7 @@ phase_vprep() {
     return
   fi
   local prep=("$PY" -m data_processing.prepare_colmap_artifixer_inputs --colmap_dir "$COLMAP" --output_root "$V"
-              --reconstruction_checkpoint "$CKPT" ${FORCE:+--replace})
+              --reconstruction_checkpoint "$CKPT" --reconstruction_steps 30000 ${FORCE:+--replace})
   "${prep[@]}" --phases prepare
   "$PY" scripts/bakerh/make_trajectory.py --transforms "$V/3dgrut_input/$S/nerfstudio/transforms.json" \
       --output "$O/trajectory_input.json" --side "$TRAJ_SIDE" --up "$TRAJ_UP"
@@ -348,10 +380,91 @@ phase_vaf3dplus() {
       --num_views "$NUM_VIEWS" "${MEM_ARGS[@]}" --replace_if_exists
 }
 
+phase_views() {
+  # Baselines on a subset of the views (FRAMES): a COLMAP copy that holds only those photos.
+  if [ -z "${FRAMES:-}" ]; then
+    echo "all views of $COLMAP"
+    return
+  fi
+  "$PY" scripts/bakerh/subset_colmap.py --scene_root "$SR" --colmap_dir "$COLMAP" --output_dir "$PCOLMAP" \
+      --frames "$FRAMES"
+}
+
+# Inpaint360GS 3DGUT port (inpaint360gs/README.md); the FlashSplat removal replaces its SAM2 +
+# association + distillation stages.
+phase_i360remove() {
+  "$PY" -m inpaint360gs.remove --checkpoint "$CKPT" --colmap_dir "$PCOLMAP" --output_dir "$O" --flashsplat_dir "$FSP"
+}
+phase_i360virtual() {
+  "$PY" -m inpaint360gs.virtual_views --checkpoint "$CKPT" --colmap_dir "$PCOLMAP" --output_dir "$O"
+}
+phase_i360nbs() {
+  "$PY" -m inpaint360gs.nbs_masks --output_dir "$O" --mode footprint
+}
+phase_i360lama() {
+  "$PY" -m inpaint360gs.lama --output_dir "$O" --lama_model "$LAMA"
+}
+phase_i360init() {
+  "$PY" -m inpaint360gs.init_gaussians --output_dir "$O" --colmap_dir "$PCOLMAP"
+}
+phase_i360finetune() {
+  "$PY" -m inpaint360gs.finetune --output_dir "$O" --checkpoint "$CKPT" --colmap_dir "$PCOLMAP"
+}
+
+# AuraFusion360 3DGUT port (aurafusion/README.md); SAM2, AGDD and SDEdit run in .venv_af2d.
+af_ref() {  # REF_INDEX, else the view with the largest unseen mask (it sees most of what must be filled)
+  if [ -n "${REF_INDEX:-}" ]; then
+    echo "$REF_INDEX"
+    return
+  fi
+  if [ ! -s "$O/reference_index.txt" ]; then
+    "$PY" -c 'import sys
+from pathlib import Path
+import numpy as np
+from PIL import Image
+paths = sorted(Path(sys.argv[1]).glob("*.png"))
+area = [np.count_nonzero(np.asarray(Image.open(p)) > 127) for p in paths]
+print(int(paths[int(np.argmax(area))].stem))' "$O/unseen_dilated" > "$O/reference_index.txt"
+  fi
+  cat "$O/reference_index.txt"
+}
+phase_afrender() {
+  "$PY" -m aurafusion.render_views --checkpoint "$CKPT" --colmap_dir "$PCOLMAP" --flashsplat_dir "$FSP" --output_dir "$O"
+}
+phase_afcontour() {
+  "$PY" -m aurafusion.unseen_contour --render_dir "$O"
+}
+phase_afsam2() {
+  rm -f "$O/reference_index.txt"
+  "$AF_PY" -m aurafusion.sam2_unseen --render_dir "$O"
+}
+phase_afagdd() {
+  local ref
+  ref=$(af_ref)
+  echo "reference view: $ref"
+  "$AF_PY" -m aurafusion.agdd --render_dir "$O" --colmap_dir "$PCOLMAP" --reference_index "$ref" \
+      --lama_model "$LAMA" --marigold "$MARIGOLD"
+}
+phase_afinit() {
+  local ref
+  ref=$(af_ref)
+  "$PY" -m aurafusion.init_gaussians --render_dir "$O" --colmap_dir "$PCOLMAP" --reference_index "$ref"
+}
+phase_afsdedit() {
+  local ref
+  ref=$(af_ref)
+  TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 "$AF_PY" -m aurafusion.sdedit --render_dir "$O" --reference_index "$ref" \
+      --official_repo "$AF360_REPO" --sd2_inpainting_ckpt "$SD2_CKPT"
+}
+phase_affinetune() {
+  "$PY" -m aurafusion.finetune --render_dir "$O" --colmap_dir "$PCOLMAP"
+}
+
 {
   echo "scene=$S variant=$VARIANT phases=$PHASES seeds=${SEEDS:-} gpu=$GPU"
   echo "scene_root=$SR"; echo "flashsplat_src=$FS_SRC"; echo "flashsplat_out=$FS"; echo "masks=${MASK_DIR:-}"
   echo "vanilla path: side=$TRAJ_SIDE up=$TRAJ_UP spacings (used by vprep only)"
+  echo "baselines: flashsplat=$FSP views=$PCOLMAP (frames ${FRAMES:-all}) models=$MODELS af360_repo=$AF360_REPO af_py=$AF_PY"
   echo "frames=${FRAMES:-all} hole=$HOLE_SHAPE+${DILATE}px refs=render outside=$OUTSIDE num_views=$NUM_VIEWS"
   echo "scene_caption=$SCENE_CAPTION"; echo "empty_caption=$EMPTY_CAPTION"
   echo "python=$PY venv=${VIRTUAL_ENV:-<not active>}"; echo "model_id=$MODEL_ID"; echo "checkpoint=$CHECKPOINT_PT"
@@ -388,9 +501,14 @@ if [[ ",$PHASES," == *,af3dplus,* ]]; then
 fi
 if [[ ",$PHASES," == *,vaf3dplus,* ]]; then
   echo
-  echo "3DGUT path renders:   $V/recon_results/$S/reconstruction/$S/ours_10000/trajectory/renders"
+  echo "3DGUT path renders:   $V/recon_results/$S/reconstruction/$S/ours_30000/trajectory/renders"
   echo "ArtiFixer output:"; find "$O/artifixer" -name '*.mp4' | head -5
   echo "ArtiFixer3D renders:  $(find "$V/artifixer3d" -type d -name renders 2>/dev/null | head -1)"
   echo "ArtiFixer3D+ output:"; find "$O/af3d_plus" -name '*.mp4' | head -5
+fi
+if [[ ",$PHASES," == *,i360finetune,* || ",$PHASES," == *,affinetune,* ]]; then
+  echo
+  echo "Final renders ($VARIANT, every view): $O/final/rgb"
+  [ -d "$O/final/virtual_rgb" ] && echo "Virtual views: $O/final/virtual_rgb"
 fi
 exit 0
