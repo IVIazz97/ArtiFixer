@@ -145,7 +145,7 @@ def main() -> None:
 
         load = lambda name: torch.load(args.flashsplat_dir / name, map_location="cpu")  # noqa: E731
         labels = torch.load(args.flashsplat_labels or args.flashsplat_dir / "labels.pt", map_location="cpu")
-        foreground, background = removal_keep_masks(model, labels, load("contribution.pt"), load("hit_count.pt"))
+        foreground, background, _ = removal_keep_masks(model, labels, load("contribution.pt"), load("hit_count.pt"))
         inside, radii[1] = hull_mask(positions, foreground, expand=args.hull_expand)
         objects[1], target_ids, surrounding_ids = ~background | inside, [1], []
         footprint = foreground | inside  # ~background also holds never-seen Gaussians

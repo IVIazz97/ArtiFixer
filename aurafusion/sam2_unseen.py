@@ -80,6 +80,9 @@ def main() -> None:
                                             box=np.array([[xs.min(), ys.min()], [xs.max(), ys.max()]], dtype=np.float32))
             prompted += 1
         print(f"SAM2: box prompts on {prompted}/{len(renders)} frames")
+        if prompted == 0:
+            raise SystemExit("unseen_contour/ is empty in every view, so there is nothing to prompt SAM2 with "
+                             "(see the unseen_contour log)")
         masks = {}
         for frame_idx, obj_ids, logits in predictor.propagate_in_video(state):
             masks[frame_idx] = (logits[0, 0] > 0).cpu().numpy()

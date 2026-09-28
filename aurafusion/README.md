@@ -56,6 +56,9 @@ reach mean IoU 0.77 (median 0.81) against the released official ones over all 27
 - **Removal** uses FlashSplat labels and our convex-hull filter, not their learned per-Gaussian mask.
 - **Removal region R** is object opacity > 0.02 instead of the exact test "depth changed". Points behind a camera count as seen.
 - **SAM2 box prompt** comes from the contour's largest connected component, so a stray floater pixel cannot inflate it.
+- **Unseen contour on partial captures:** when the official mean (over every view showing the object, out-of-frame
+  counting as seen) leaves the contour empty in every view, `unseen_contour --denominator auto` (default) recomputes
+  it averaging only over the views the point lands in, with points no other view frames counting as unseen.
 - **Reference image:**
   - For Other-360 the official code loads a pre-inpainted reference image.
   - Here it is built from the photo, the removed render and LaMa, or taken from `--reference_image`.
