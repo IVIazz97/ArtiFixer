@@ -8,6 +8,9 @@ Removes the FlashSplat-labelled object with the same filters as
 ``data_processing.render_flashsplat_extraction`` (visible-contribution threshold, label-0
 background, background Gaussians inside the trimmed object hull dropped) -- the official code's
 removal is the same idea: labelled Gaussians plus everything inside their convex hull.
+With ``--removal_pt`` the removal comes instead from an ``inpaint360gs.remove`` removal.pt, e.g.
+Gaussians whose object probability, distilled from 2D object masks, exceeds a threshold, plus
+their hull (the official "object-masked Gaussians" removal).
 
 Writes, for every COLMAP view in dataset order:
   removed/rgb/<i>.png      removed-scene RGB
@@ -79,7 +82,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--colmap_dir", type=Path, required=True)
-    parser.add_argument("--flashsplat_dir", type=Path, required=True, help="Holds contribution.pt and hit_count.pt.")
+    parser.add_argument("--flashsplat_dir", type=Path, default=None, help="Holds contribution.pt and hit_count.pt.")
+    parser.add_argument("--removal_pt", type=Path, default=None,
+                        help="Instead of FlashSplat: an inpaint360gs removal.pt (removed and footprint masks).")
     parser.add_argument("--labels", type=Path, default=None, help="Defaults to <flashsplat_dir>/labels.pt.")
     parser.add_argument("--object_id", type=int, default=1)
     parser.add_argument("--hull_expand", type=float, default=0.0,
@@ -91,11 +96,19 @@ def main() -> None:
     out = args.output_dir
     model, conf, checkpoint = load_model(args.checkpoint, all_views_overrides(args.colmap_dir))
     dataset, loader = build_dataset(conf)
-    labels = torch.load(args.labels or args.flashsplat_dir / "labels.pt", map_location="cpu")
-    contribution = torch.load(args.flashsplat_dir / "contribution.pt", map_location="cpu")
-    hit_count = torch.load(args.flashsplat_dir / "hit_count.pt", map_location="cpu")
-    foreground, background, deleted = removal_keep_masks(model, labels, contribution, hit_count, args.object_id,
-                                                        hull_expand=args.hull_expand)
+    if args.removal_pt is not None:
+        removal = torch.load(args.removal_pt, map_location="cpu")
+        assert removal["removed"].shape[0] == model.num_gaussians, "removal.pt is for another checkpoint"
+        removed = removal["removed"].to(model.positions.device)
+        foreground = removal["footprint"].to(removed.device) & removed
+        background, deleted = ~removed, removed & ~foreground
+    else:
+        assert args.flashsplat_dir is not None, "give --flashsplat_dir or --removal_pt"
+        labels = torch.load(args.labels or args.flashsplat_dir / "labels.pt", map_location="cpu")
+        contribution = torch.load(args.flashsplat_dir / "contribution.pt", map_location="cpu")
+        hit_count = torch.load(args.flashsplat_dir / "hit_count.pt", map_location="cpu")
+        foreground, background, deleted = removal_keep_masks(model, labels, contribution, hit_count, args.object_id,
+                                                            hull_expand=args.hull_expand)
     print(f"{model.num_gaussians} Gaussians: object={int(foreground.sum())}, kept background={int(background.sum())}, "
           f"background deleted inside the hull={int(deleted.sum())}")
 

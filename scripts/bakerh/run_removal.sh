@@ -14,6 +14,12 @@
 #              af360    AuraFusion360 3DGUT port (aurafusion/): SAM2 unseen masks, Marigold AGDD,
 #                       LeftRefill SDEdit. Both need setup_baselines.sh once; see "Baselines" below.
 #                       run_baselines.sh runs both on all three scenes.
+#              i360sam  Inpaint360GS with its own segmentation (SAM2 automatic masks, association,
+#                       identity distillation); the object is picked with MASK_DIR, the SAM masks
+#                       FlashSplat uses
+#              af360sam AuraFusion360 with its own removal: an object probability distilled into the
+#                       Gaussians from the MASK_DIR masks, > 0.6 plus the IQR-filtered hull (official)
+#              run_sequence.sh runs vanilla, then every inpainting variant on all three scenes.
 #
 # Part 1 (default): prep, flashsplat, derive, split, infer. Ends with a single-rollout ArtiFixer
 # video; look at it and note frames where the hole is filled cleanly. Then part 2:
@@ -36,6 +42,7 @@
 # 49-148,284-304, the ArtiFixer frames). af360's reference view is the one with the largest unseen
 # mask (REF_INDEX overrides). Models come from the local folders in MODELS (no Hugging Face); the
 # af360 2D stages run in .venv_af2d. Final renders of every view: <variant>/final/rgb.
+# A baseline job whose final model exists for the same views is skipped (FORCE=1 redoes it).
 #
 # Env knobs: GPU (1), NUM_VIEWS (6), DILATE, HOLE_SHAPE, FRAMES, COMPRESSOR_FRAMES, MASK_DIR, SCENE_CAPTION,
 # EMPTY_CAPTION, METRIC_SCALE, OUTSIDE (photo|render), AF3D_STEPS (30000), PY, SCENE_ROOT, FS_SRC, OUT_ROOT,
@@ -43,8 +50,8 @@
 # Outputs: output/bakerh_removal/<scene>/<variant>/. Logs: .../logs/<timestamp>/NN_<phase>.log and
 # .../logs/summary.log (start, end, duration and peak GPU memory of every phase, across runs).
 set -euo pipefail
-SCENE=${1:?usage: run_removal.sh SCENE VARIANT   (SCENE: TA_BLUE_MOTOR|PCV|Compressor, VARIANT: normal|bighull|vanilla|i360|af360)}
-VARIANT=${2:?usage: run_removal.sh SCENE VARIANT   (VARIANT: normal|bighull|vanilla|i360|af360)}
+SCENE=${1:?usage: run_removal.sh SCENE VARIANT   (SCENE: TA_BLUE_MOTOR|PCV|Compressor, VARIANT: normal|bighull|vanilla|i360|af360|i360sam|af360sam)}
+VARIANT=${2:?usage: run_removal.sh SCENE VARIANT   (VARIANT: normal|bighull|vanilla|i360|af360|i360sam|af360sam)}
 AF=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$AF"
 
@@ -101,8 +108,8 @@ case $VARIANT in
   vanilla) HOLE_SHAPE=none; DILATE=0
     # One path frame per photo: all 923 Compressor photos would not fit through ArtiFixer.
     [ "$S" != Compressor ] || { echo "vanilla is for TA_BLUE_MOTOR and PCV only" >&2; exit 2; } ;;
-  i360|af360) HOLE_SHAPE=none; DILATE=0; export HF_HUB_OFFLINE=1 ;;
-  *) echo "unknown VARIANT '$VARIANT' (normal, bighull, vanilla, i360, af360)" >&2; exit 2 ;;
+  i360|af360|i360sam|af360sam) HOLE_SHAPE=none; DILATE=0; export HF_HUB_OFFLINE=1 ;;
+  *) echo "unknown VARIANT '$VARIANT' (normal, bighull, vanilla, i360, af360, i360sam, af360sam)" >&2; exit 2 ;;
 esac
 TRAJ_SIDE=${TRAJ_SIDE:-2}
 TRAJ_UP=${TRAJ_UP:-0.5}
@@ -133,12 +140,17 @@ pred_dir() {  # newest single-rollout prediction dir under $1 (empty if none)
   find "$1" -type d -path '*/frames/batch_0000/pred' -printf '%T@ %p\n' | sort -nr | awk 'NR == 1 { sub(/^[^ ]+ /, ""); print }'
 }
 
+USER_PHASES=${PHASES:-}
 if [ -z "${PHASES:-}" ] && [ "$VARIANT" = vanilla ]; then
   PHASES=vprep,vinfer,vaf3d,vaf3dplus
 elif [ -z "${PHASES:-}" ] && [ "$VARIANT" = i360 ]; then
   PHASES=flashsplat,views,i360remove,i360virtual,i360nbs,i360lama,i360init,i360finetune
 elif [ -z "${PHASES:-}" ] && [ "$VARIANT" = af360 ]; then
   PHASES=flashsplat,views,afrender,afcontour,afsam2,afagdd,afinit,afsdedit,affinetune
+elif [ -z "${PHASES:-}" ] && [ "$VARIANT" = i360sam ]; then
+  PHASES=views,i360masks,i360associate,i360distill,i360remove,i360virtual,i360nbs,i360lama,i360init,i360finetune
+elif [ -z "${PHASES:-}" ] && [ "$VARIANT" = af360sam ]; then
+  PHASES=views,afsegmasks,afsegdistill,afsegremove,afrender,afcontour,afsam2,afagdd,afinit,afsdedit,affinetune
 elif [ -z "${PHASES:-}" ]; then
   PHASES=prep,flashsplat,derive,split,infer
   if [ -n "${SEEDS:-}" ]; then
@@ -156,12 +168,20 @@ N=0
 # One line to the screen, this run's summary.log and the variant's cumulative summary.log.
 note() { echo "[$(date '+%F %T')] $S/$VARIANT $*" | tee -a "$SUMMARY" "$LOG_DIR/summary.log"; }
 
+if [[ $VARIANT == i360* || $VARIANT == af360* ]] && [ -z "$USER_PHASES" ] && [ -z "${FORCE:-}" ] \
+    && [ -f "$O/final/ckpt_final.pt" ] \
+    && [ "$(cat "$O/views.txt" 2>/dev/null || echo "${FRAMES:-all}")" = "${FRAMES:-all}" ]; then
+  note "SKIP: already finished on views ${FRAMES:-all} ($O/final; FORCE=1 redoes it)"
+  exit 0
+fi
+
 missing=()
 needed=("$PY" "$CKPT" "$CHECKPOINT_PT" "$MODEL_ID" "$COLMAP")
 [ "$VARIANT" = vanilla ] || needed+=("${MASK_DIR:-<MASK_DIR: no masks_npy under $SAM_MASKS/$S>}")
 case $VARIANT in
-  i360)  needed+=("$LAMA") ;;
-  af360) needed+=("$LAMA" "$MARIGOLD" "$SD2_CKPT" "$AF360_REPO/utils/LeftRefill" "$AF_PY") ;;
+  i360)           needed+=("$LAMA") ;;
+  i360sam)        needed+=("$LAMA" "$AF_PY") ;;
+  af360|af360sam) needed+=("$LAMA" "$MARIGOLD" "$SD2_CKPT" "$AF360_REPO/utils/LeftRefill" "$AF_PY") ;;
 esac
 for f in "${needed[@]}"; do
   [ -e "$f" ] || missing+=("$f")
@@ -382,6 +402,8 @@ phase_vaf3dplus() {
 
 phase_views() {
   # Baselines on a subset of the views (FRAMES): a COLMAP copy that holds only those photos.
+  rm -f "$O/final/ckpt_final.pt"  # the job is being redone; views.txt + this file mark it finished
+  echo "${FRAMES:-all}" > "$O/views.txt"
   if [ -z "${FRAMES:-}" ]; then
     echo "all views of $COLMAP"
     return
@@ -390,10 +412,23 @@ phase_views() {
       --frames "$FRAMES"
 }
 
-# Inpaint360GS 3DGUT port (inpaint360gs/README.md); the FlashSplat removal replaces its SAM2 +
-# association + distillation stages.
+# Inpaint360GS 3DGUT port (inpaint360gs/README.md). i360: the FlashSplat removal replaces its SAM2 +
+# association + distillation stages. i360sam: its own stages, the target picked with MASK_DIR.
+phase_i360masks() {
+  "$AF_PY" -m inpaint360gs.raw_masks --image_dir "$PCOLMAP/images" --output_dir "$O"
+}
+phase_i360associate() {
+  "$PY" -m inpaint360gs.associate --checkpoint "$CKPT" --colmap_dir "$PCOLMAP" --output_dir "$O"
+}
+phase_i360distill() {
+  "$PY" -m inpaint360gs.distill --checkpoint "$CKPT" --colmap_dir "$PCOLMAP" --output_dir "$O"
+}
 phase_i360remove() {
-  "$PY" -m inpaint360gs.remove --checkpoint "$CKPT" --colmap_dir "$PCOLMAP" --output_dir "$O" --flashsplat_dir "$FSP"
+  if [ "$VARIANT" = i360sam ]; then
+    "$PY" -m inpaint360gs.remove --checkpoint "$CKPT" --colmap_dir "$PCOLMAP" --output_dir "$O" --target_masks_dir "$MASK_DIR"
+  else
+    "$PY" -m inpaint360gs.remove --checkpoint "$CKPT" --colmap_dir "$PCOLMAP" --output_dir "$O" --flashsplat_dir "$FSP"
+  fi
 }
 phase_i360virtual() {
   "$PY" -m inpaint360gs.virtual_views --checkpoint "$CKPT" --colmap_dir "$PCOLMAP" --output_dir "$O"
@@ -428,8 +463,23 @@ print(int(paths[int(np.argmax(area))].stem))' "$O/unseen_dilated" > "$O/referenc
   fi
   cat "$O/reference_index.txt"
 }
+# af360sam: the official object-masked-Gaussians removal. The MASK_DIR masks become 2-class id maps,
+# distilled into the Gaussians (inpaint360gs.distill); object probability > 0.6 (official
+# removal_thresh) plus the IQR-filtered hull (inpaint360gs.remove) is removed.
+phase_afsegmasks() {
+  "$PY" scripts/bakerh/masks_to_ids.py --image_dir "$PCOLMAP/images" --mask_dir "$MASK_DIR" --output_dir "$O/seg/associated"
+}
+phase_afsegdistill() {
+  "$PY" -m inpaint360gs.distill --checkpoint "$CKPT" --colmap_dir "$PCOLMAP" --output_dir "$O/seg"
+}
+phase_afsegremove() {
+  "$PY" -m inpaint360gs.remove --checkpoint "$CKPT" --colmap_dir "$PCOLMAP" --output_dir "$O/seg" \
+      --target_ids 1 --removal_thresh 0.6
+}
 phase_afrender() {
-  "$PY" -m aurafusion.render_views --checkpoint "$CKPT" --colmap_dir "$PCOLMAP" --flashsplat_dir "$FSP" --output_dir "$O"
+  local removal=(--flashsplat_dir "$FSP")
+  [ "$VARIANT" = af360sam ] && removal=(--removal_pt "$O/seg/removal/removal.pt")
+  "$PY" -m aurafusion.render_views --checkpoint "$CKPT" --colmap_dir "$PCOLMAP" "${removal[@]}" --output_dir "$O"
 }
 phase_afcontour() {
   "$PY" -m aurafusion.unseen_contour --render_dir "$O"
