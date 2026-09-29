@@ -102,6 +102,12 @@ object-free ground truth for mip360, so the hole itself is not scored.
   than one (`len(surrounding_ids) > 1`).
 - **All views** (train + test) are used for distillation and for the virtual-radius PCA.
   Upstream uses the `--eval` train split.
+- **LaMa output size.** Above 1.8 MP the official refiner works at a reduced size and returns
+  that size. Here the result is scaled back up bilinearly, and the pixels outside the hole are
+  kept, so the depth and colour match the masks (e.g. 1600x1199 bakerh views).
+- **Distillation cross-entropy** is computed in pixel chunks and recomputed in the backward
+  pass. The result is identical, but the full [H·W, classes] logits are never stored at once.
+  With ~1500 SAM classes at 1600x1200, those logits alone take 11 GB.
 
 Kept as in the official code, where it differs from the paper:
 

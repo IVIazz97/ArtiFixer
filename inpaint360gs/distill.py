@@ -27,6 +27,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from inpaint360gs.common import (
     SH_C0, all_views_overrides, build_dataset, colorize_ids, dataset_views, load_ids, load_model, render_features,
@@ -43,6 +44,34 @@ def neighbour_cosine_loss(xyz, features, k=5, max_points=200_000, sample_size=10
     neighbours = torch.cdist(xyz[sample], xyz).topk(k, largest=False).indices
     cosine = F.cosine_similarity(features[sample][:, None].expand(-1, k, -1), features[neighbours], dim=-1)
     return 1 - cosine.mean()
+
+
+PIXEL_CHUNK = 1 << 17
+
+
+def pixel_logits(classifier, features: torch.Tensor) -> torch.Tensor:
+    """[P, C] classifier logits of [P, K] rendered features (the 1x1 convolution as a linear map)."""
+    return F.linear(features, classifier.weight.flatten(1), classifier.bias)
+
+
+def identity_loss(classifier, rendered: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Mean per-pixel cross-entropy of ``classifier(rendered)`` against ``target``, evaluated in
+    pixel chunks with recomputation so the [H*W, num_classes] logits are never held at once
+    (with ~1500 classes at 1600x1200 they alone take 11 GB)."""
+    features, target = rendered.reshape(-1, rendered.shape[-1]), target.reshape(-1)
+    chunk_loss = lambda f, t: F.cross_entropy(pixel_logits(classifier, f), t, reduction="sum")  # noqa: E731
+    total = sum(checkpoint(chunk_loss, features[s:s + PIXEL_CHUNK], target[s:s + PIXEL_CHUNK], use_reentrant=False)
+                for s in range(0, target.shape[0], PIXEL_CHUNK))
+    return total / target.shape[0]
+
+
+@torch.no_grad()
+def predict_ids(classifier, rendered: torch.Tensor) -> torch.Tensor:
+    """[H, W] argmax object id of ``classifier(rendered)``, in pixel chunks."""
+    features = rendered.reshape(-1, rendered.shape[-1])
+    ids = torch.cat([pixel_logits(classifier, features[s:s + PIXEL_CHUNK]).argmax(1)
+                     for s in range(0, features.shape[0], PIXEL_CHUNK)])
+    return ids.reshape(rendered.shape[:2])
 
 
 def main() -> None:
@@ -89,8 +118,7 @@ def main() -> None:
             order = torch.randperm(len(batches)).tolist()
         index = order.pop()
         rendered = render_features(model, batches[index], features, frame_id=index)
-        logits = classifier(rendered.permute(2, 0, 1)[None])
-        loss_2d = F.cross_entropy(logits, targets[index][None]) / log_classes
+        loss_2d = identity_loss(classifier, rendered, targets[index]) / log_classes
         loss = loss_2d
         if iteration % args.reg3d_interval == 0:
             loss = loss + args.sim_weight * neighbour_cosine_loss(
@@ -109,8 +137,7 @@ def main() -> None:
     accuracy = []
     with torch.no_grad():
         for index, (batch, camera) in enumerate(zip(batches, cameras)):
-            logits = classifier(render_features(model, batch, features, frame_id=index).permute(2, 0, 1)[None])
-            pred = logits[0].argmax(0)
+            pred = predict_ids(classifier, render_features(model, batch, features, frame_id=index))
             accuracy.append((pred == targets[index]).float().mean().item())
             pred = pred.cpu().numpy()
             stem = Path(camera.name).stem

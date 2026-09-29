@@ -95,7 +95,12 @@ def pad_to_modulo(x: torch.Tensor, modulo: int = 8) -> torch.Tensor:
 
 def refine_predict(lama: Lama, image: torch.Tensor, mask: torch.Tensor, n_iters: int = 15, lr: float = 0.002,
                    min_side: int = 512, max_scales: int = 3, px_budget: int = 1_800_000) -> torch.Tensor:
-    """Official ``refine_predict`` for one [1, 3, H, W] image and [1, 1, H, W] mask (1 = hole)."""
+    """Official ``refine_predict`` for one [1, 3, H, W] image and [1, 1, H, W] mask (1 = hole).
+
+    Above ``px_budget`` the official refiner works (and returns) at a reduced size; the result is
+    scaled back here to [1, 3, H, W], keeping the input outside the hole.
+    """
+    full_image, full_mask = image, mask
     h, w = image.shape[2:]
     if h * w > px_budget:
         ratio = math.sqrt(px_budget / float(h * w))
@@ -134,6 +139,9 @@ def refine_predict(lama: Lama, image: torch.Tensor, mask: torch.Tensor, n_iters:
                 loss.backward()
                 optimizer.step()
         inpainted = (mask3 * pred + (1 - mask3) * image).detach()[:, :, :oh, :ow]
+    if inpainted.shape[2:] != full_image.shape[2:]:
+        inpainted = F.interpolate(inpainted, size=full_image.shape[2:], mode="bilinear", align_corners=False)
+        inpainted = full_mask * inpainted + (1 - full_mask) * full_image
     return inpainted
 
 
@@ -168,9 +176,6 @@ def main() -> None:
             both = refine_predict(lama, torch.cat([previous, image], dim=3), torch.cat([torch.zeros_like(mask), mask], dim=3),
                                   **refine)
             color = both[:, :, :, both.shape[3] // 2:]
-            color = F.interpolate(color, size=image.shape[2:], mode="bicubic", align_corners=False).clamp(0, 1) \
-                if color.shape[2:] != image.shape[2:] else color
-            color = mask * color + (1 - mask) * image
         else:
             color = refine_predict(lama, image, mask, **refine)
         previous = color
