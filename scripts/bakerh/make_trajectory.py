@@ -33,7 +33,9 @@ was trained in) and writes a camera path in one of three modes (--mode):
 
 Collision checks. With --checkpoint the 3DGUT Gaussians become an occupancy field (see Occupancy).
 In travel and object mode every path camera must
-  (a) keep --clearance from any surface, the object included,
+  (a) keep --clearance from any surface, the object included (a base camera already closer than
+      that, because the photographer stood there, keeps its own distance instead: the largest of
+      half, a quarter or an eighth of the clearance it has),
   (b) be reachable from its base camera in a straight line through free space, so it can never
       end up inside or behind a wall, and
   (c) in object mode, see the centre of mass with no surface in between, wherever its base camera
@@ -103,6 +105,12 @@ def build_parser():
     parser.add_argument("--periods", type=float, default=2.0, help="Weaves over the whole path.")
     parser.add_argument("--sigma", type=float, default=2.0, help="Smoothing width, in photos.")
     parser.add_argument("--jump", type=float, default=4.0, help="A step above this many spacings splits the path.")
+    parser.add_argument("--phase_offset", type=float, default=0.0,
+                        help="Shift of the weave (travel/object) or of the seed photos (vidsplat), in periods/seed "
+                             "spacings: repeated rounds with different offsets pick different viewpoints.")
+    parser.add_argument("--seen_transforms", type=Path, default=None,
+                        help="Trajectory JSON of views already generated (earlier rounds): their surface counts as "
+                             "seen in the unseen test, so new orbits look for what is still missing.")
     parser.add_argument("--max_frames", type=int, default=None,
                         help="At most this many path frames (travel/object: every k-th frame; vidsplat: the default budget).")
     travel = parser.add_argument_group("travel mode, in median photo spacings")
@@ -182,12 +190,15 @@ class Occupancy:
 
     def _mahalanobis2(self, x, g, widen):
         local = np.einsum("nji,nj->ni", self.rot[g], x - self.mu[g])
-        return (local**2 / (self.scale2[g] + widen**2)).sum(1)
+        return (local**2 / (self.scale2[g] + np.reshape(widen, (-1, 1)) ** 2)).sum(1)
 
     def alpha(self, x, widen, skip=None):
+        """A(x) at points x [M, 3], widened by widen (one value, or one per point)."""
         out = np.zeros(len(x))
-        for p, g in self._pairs(x, lambda sigma: 3 * np.hypot(sigma, widen)):
-            value = self.opacity[g] * np.exp(-0.5 * self._mahalanobis2(x[p], g, widen))
+        widen = np.broadcast_to(np.asarray(widen, dtype=np.float64), (len(x),))
+        reach = float(widen.max(initial=0))
+        for p, g in self._pairs(x, lambda sigma: 3 * np.hypot(sigma, reach)):
+            value = self.opacity[g] * np.exp(-0.5 * self._mahalanobis2(x[p], g, widen[p]))
             if skip is not None:
                 value[skip[g]] = 0
             np.maximum.at(out, p, value)
@@ -363,16 +374,17 @@ def clearance_for(args, spacing, obj_):
 
 
 def free_segments(field, starts, ends, clearance, solid, skip_start=None):
-    """Whether each straight segment starts[m] -> ends[m] keeps the clearance from every surface
-    (samples at most a clearance apart; the first clearance of a segment whose start is flagged in
-    skip_start is not checked, for starts that already touch a surface)."""
+    """Whether each straight segment starts[m] -> ends[m] keeps the clearance (one value, or one per
+    segment) from every surface (samples at most a clearance apart, up to 64; the first clearance of a
+    segment whose start is flagged in skip_start is not checked, for starts inside a surface)."""
     length = np.linalg.norm(ends - starts, axis=1)
-    k = int(np.clip(np.ceil(length.max(initial=0) / clearance) + 1, 2, 64))
+    clearance = np.broadcast_to(np.asarray(clearance, dtype=np.float64), (len(starts),))
+    k = int(np.clip(np.ceil((length / clearance).max(initial=0)) + 1, 2, 64))
     t = np.arange(1, k + 1) / k
     samples = starts[:, None] + t[None, :, None] * (ends - starts)[:, None]
-    blocked = (field.alpha(samples.reshape(-1, 3), clearance) > solid).reshape(-1, k)
+    blocked = (field.alpha(samples.reshape(-1, 3), np.repeat(clearance, k)) > solid).reshape(-1, k)
     if skip_start is not None:
-        blocked &= ~(skip_start[:, None] & (t[None] * length[:, None] < clearance))
+        blocked &= ~(skip_start[:, None] & (t[None] * length[:, None] < clearance[:, None]))
     return ~blocked.any(1)
 
 
@@ -531,10 +543,10 @@ def offset_path(args, photos, gaussians, obj_, clearance, checker):
         """Path camera i at offset scale s (0 = base camera)."""
         m = base[i].copy()
         if obj_ is None:
-            side = args.side * spacing * np.sin(2 * np.pi * args.periods * i / (n - 1))
+            side = args.side * spacing * np.sin(2 * np.pi * args.periods * i / (n - 1) + 2 * np.pi * args.phase_offset)
             m[:3, 3] += s * (side * across[i] + args.up * spacing * m[:3, 1])
             return m
-        phase = 2 * np.pi * args.periods * i / (n - 1)
+        phase = 2 * np.pi * args.periods * i / (n - 1) + 2 * np.pi * args.phase_offset
         R, w0 = obj_.radius, base[i, :3, 3] - obj_.centre
         height = w0 @ world_up
         horiz = w0 - height * world_up
@@ -551,7 +563,7 @@ def offset_path(args, photos, gaussians, obj_, clearance, checker):
         m[:3, :3] = (Rotation.from_rotvec(args.look_at * (aim * photo.inv()).as_rotvec()) * photo).as_matrix()
         return m
 
-    info = {"offset_scale": None, "segments": len(segments)}
+    info = {"offset_scale": None, "segments": len(segments), "pieces": [[int(seg[0]), int(seg[-1])] for seg in segments]}
     scale = np.ones(n)
     if gaussians is None:
         return np.array([camera(i, 1.0) for i in range(n)]), scale, info, None
@@ -559,6 +571,13 @@ def offset_path(args, photos, gaussians, obj_, clearance, checker):
     field, keep = occupancy_field(gaussians, args.solid, np.concatenate([photos.pos, base[:, :3, 3]]))
     skip_object = obj_.mask[keep] if obj_ else None
     base_blocked = field.alpha(base[:, :3, 3], clearance) > args.solid
+    # A base camera already closer than the clearance to a surface (the photographer stood there) may
+    # move as long as it comes no closer than it already is: its own clearance is the largest of
+    # clearance/2, /4, /8 it keeps. Only base cameras that keep none of them skip the start of (b).
+    own = np.full(n, clearance)
+    for c in clearance / np.array([2.0, 4.0, 8.0]):
+        own[field.alpha(base[:, :3, 3], own) > args.solid] = c
+    base_inside = field.alpha(base[:, :3, 3], own) > args.solid
 
     def sees_object(p):
         """Whether the segment from each camera position to the object is free of other surfaces."""
@@ -582,8 +601,8 @@ def offset_path(args, photos, gaussians, obj_, clearance, checker):
     def feasible(cams, owner):
         """Checks (a)-(c) for cameras cams [M, 4, 4] offset from base cameras owner [M]."""
         p = cams[:, :3, 3]
-        ok = field.alpha(p, clearance) <= args.solid  # (a)
-        ok &= free_segments(field, base[owner, :3, 3], p, clearance, args.solid, base_blocked[owner])  # (b)
+        ok = field.alpha(p, own[owner]) <= args.solid  # (a)
+        ok &= free_segments(field, base[owner, :3, 3], p, own[owner], args.solid, base_inside[owner])  # (b)
         if check_view and base_sees[owner].any():
             ok[base_sees[owner]] &= sees_object(p[base_sees[owner]])  # (c)
         if checker is not None and ok.any():
@@ -610,11 +629,13 @@ def offset_path(args, photos, gaussians, obj_, clearance, checker):
     path = np.array([camera(i, s) for i, s in enumerate(scale)])
     print(f"offset scale: mean {scale.mean():.2f}, {int((scale < 1).sum())}/{n} frames pulled back, "
           f"{int((scale == 0).sum())} at their base camera; {len(bad)} snapped to a tested level; "
-          f"{int(base_blocked.sum())} base cameras closer than the clearance to a surface"
+          f"{int(base_blocked.sum())} base cameras closer than the clearance to a surface (kept at least as far as "
+          f"they are; {int(base_inside.sum())} inside one)"
           + (f", {int((~base_sees).sum())} whose view of the object is blocked (no view check there)" if check_view else ""))
-    if base_blocked.mean() > 0.2:
-        print("WARNING: many base cameras already touch a surface: lower --clearance or raise --solid")
+    if base_inside.mean() > 0.2:
+        print("WARNING: many base cameras are inside a surface: raise --solid")
     info.update(offset_scale=np.round(scale, 4).tolist(), base_cameras_touching=int(base_blocked.sum()),
+                base_cameras_inside=int(base_inside.sum()),
                 render_check=checker is not None)
     collapsed = float(np.mean(scale < 0.25))
     info["collapsed_share"] = collapsed
@@ -645,7 +666,8 @@ def vidsplat_path(args, photos, gaussians, clearance, checker):
     field, keep = occupancy_field(gaussians, args.solid, photos.pos)
     photo_blocked = field.alpha(photos.pos, clearance) > args.solid
     d0_base = args.d0_m / args.metric_scale if args.metric_scale else None
-    seeds = np.unique(np.round(np.linspace(0, n - 1, min(n, 2 * n_clips))).astype(int))
+    m = min(n, 2 * n_clips)
+    seeds = np.unique(np.round(np.linspace(0, n - 1, m) + args.phase_offset * 2 * (n - 1) / max(m - 1, 1)).astype(int) % n)
     counts = dict.fromkeys(REJECT_REASONS, 0)
     per_seed = {}
     for j in seeds:
@@ -726,11 +748,24 @@ def vidsplat_path(args, photos, gaussians, clearance, checker):
             + ", ".join(f"{k} {v}" for k, v in counts.items() if v)
             + ". Loosen --s_high/--s_low (TRAJ_S_HIGH/TRAJ_S_LOW), --d0_m (TRAJ_D0_M) or --orbit_deg (TRAJ_ORBIT_DEG), "
             "or lower --min_clips", path, info)
+    info["pieces"] = pieces_of(len(path), [1 + k * L for k in range(1, len(chosen))])
     clip_id = np.r_[-1, np.repeat(np.arange(len(chosen)), L)]
     return path, clip_id, info, (keep, field)
 
 
 # ---------------------------------------------------------------------------- output
+
+def pieces_of(n, starts):
+    """[first, last] frame of each continuous piece of an n-frame path whose pieces start at starts."""
+    starts = sorted({int(a) for a in starts if 0 < a < n} | {0})
+    return [[a, b - 1] for a, b in zip(starts, starts[1:] + [n])]
+
+
+def jump_lengths(path, pieces, spacing):
+    """Camera move across each jump between consecutive pieces, in photo spacings."""
+    pos = path[:, :3, 3]
+    return [float(np.linalg.norm(pos[b[0]] - pos[a[1]]) / spacing) for a, b in zip(pieces, pieces[1:])]
+
 
 def write_outputs(args, photos, path, info):
     keys = ("camera_model", "w", "h", "fl_x", "fl_y", "cx", "cy", "k1", "k2", "p1", "p2")
@@ -744,7 +779,10 @@ def write_outputs(args, photos, path, info):
     return info_path
 
 
-def plot_top_view(args, photos, path, colour, colour_label, gaussians, keep, obj_, clearance, anchors=None, title=""):
+PIECE_COLOURS = ("tab:orange", "tab:green", "tab:purple", "tab:brown", "tab:pink", "tab:olive", "tab:cyan")
+
+
+def plot_top_view(args, photos, path, colour, colour_label, gaussians, keep, obj_, clearance, pieces, anchors=None, title=""):
     try:
         import matplotlib
 
@@ -783,18 +821,28 @@ def plot_top_view(args, photos, path, colour, colour_label, gaussians, keep, obj
         ax.plot(a[:, 0], a[:, 1], "rx", ms=6, label="orbit anchors")
     ax.plot(*flat(photos.pos).T, ".-", c="tab:blue", ms=3, lw=0.5, label="photos")
     p = flat(path[:, :3, 3])
-    ax.plot(*p.T, "-", c="tab:orange", lw=0.8)
-    sc = ax.scatter(*p.T, c=colour, cmap="viridis", s=6, label=f"path (colour: {colour_label})")
+    # One colour per continuous piece, numbered in video order; a dotted black line is a jump between
+    # pieces, i.e. a cut in the one ArtiFixer video.
+    for k, (a, b) in enumerate(pieces):
+        c = PIECE_COLOURS[k % len(PIECE_COLOURS)]
+        ax.plot(*p[a:b + 1].T, "-", c=c, lw=2.5, label="path, one colour per continuous piece" if k == 0 else None)
+        if k:
+            ax.plot(*p[[pieces[k - 1][1], a]].T, ":", c="k", lw=1.0,
+                    label="jump between pieces (a cut in the ArtiFixer video)" if k == 1 else None)
+        if len(pieces) > 1:
+            ax.annotate(str(k + 1), p[a], xytext=(4, 4), textcoords="offset points", color=c, fontsize=9, fontweight="bold")
+    sc = ax.scatter(*p.T, c=colour, cmap="viridis", s=6, zorder=3, label=f"path frames (colour: {colour_label})")
     look = flat(-path[:, :3, 2]) * 0.03 * (hi - lo).max()
     step = max(1, len(path) // 60)
-    ax.quiver(p[::step, 0], p[::step, 1], look[::step, 0], look[::step, 1], color="tab:orange", angles="xy",
+    ax.quiver(p[::step, 0], p[::step, 1], look[::step, 0], look[::step, 1], color="0.3", angles="xy",
               scale_units="xy", scale=1, width=0.002)
     fig.colorbar(sc, ax=ax, fraction=0.03, label=colour_label)
     ax.set_xlim(lo[0], hi[0])
     ax.set_ylim(lo[1], hi[1])
     ax.set_aspect("equal")
     ax.legend(loc="upper right")
-    ax.set_title(title or f"top view: Gaussians at camera height (grey), clearance {clearance:.3f}")
+    ax.set_title(title or f"top view: Gaussians at camera height (grey), clearance {clearance:.3f}; "
+                          f"{len(pieces)} path pieces, {len(pieces) - 1} jump{'s' * (len(pieces) != 2)}")
     fig.savefig(args.output.with_suffix(".png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"top view: {args.output.with_suffix('.png')}")
@@ -824,7 +872,12 @@ def main(argv=None, renderer=None):
     checker = None
     if need_render:
         render_fn, intr, *device = renderer or gpu_renderer(args.checkpoint, args.colmap_dir, photos, args.check_width)
-        checker = ViewChecker(render_fn, photos.c2w, intr, args.solid, args.depth_tol, device[0] if device else "cpu")
+        observers = photos.c2w  # the photos come first: anchor() and near_depth(index=) index them
+        if args.seen_transforms is not None:
+            seen = json.loads(args.seen_transforms.read_text())["frames"]
+            observers = np.concatenate([photos.c2w, np.array([f["transform_matrix"] for f in seen], dtype=np.float64)])
+            print(f"unseen test: {len(photos.c2w)} photos + {len(seen)} earlier generated views")
+        checker = ViewChecker(render_fn, observers, intr, args.solid, args.depth_tol, device[0] if device else "cpu")
 
     info = {"mode": mode, "median_spacing": photos.spacing, "clearance": clearance,
             "collision_checks": gaussians is not None}
@@ -845,6 +898,7 @@ def main(argv=None, renderer=None):
             stride = int(np.ceil(len(path) / args.max_frames))  # frames are checked one by one: any subset is safe
             path, colour = path[::stride], colour[::stride]
             info["frame_stride"] = stride
+            info["pieces"] = pieces_of(len(path), [-(-a // stride) for a, _ in info["pieces"]])
             print(f"--max_frames {args.max_frames}: every {stride}th frame, {len(path)} frames")
     except TrajectoryError as error:
         failure = error
@@ -852,10 +906,15 @@ def main(argv=None, renderer=None):
         info.update(error.info, failed=error.reason)
         colour, colour_label = np.zeros(len(path)), "failed"
 
+    pieces = info.get("pieces") or [[0, len(path) - 1]]
+    if pieces[-1][1] != len(path) - 1:  # a failed vidsplat path is cut short
+        pieces = [[0, len(path) - 1]]
+    info["pieces"] = pieces
+    info["jumps_spacings"] = [round(j, 2) for j in jump_lengths(path, pieces, photos.spacing)]
     info_path = write_outputs(args, photos, path, info)
     if gaussians is not None and keep is None:
         keep = gaussians.opacity >= args.solid
-    plot_top_view(args, photos, path, colour, colour_label, gaussians, keep, obj_, clearance,
+    plot_top_view(args, photos, path, colour, colour_label, gaussians, keep, obj_, clearance, pieces,
                   anchors=info.get("anchors"), title=f"FAILED: {failure.reason[:90]}..." if failure else "")
     if failure is not None:
         print(f"ERROR: {failure.reason}", file=sys.stderr)
@@ -864,6 +923,8 @@ def main(argv=None, renderer=None):
 
     nearest = np.linalg.norm(path[:, None, :3, 3] - photos.pos[None], axis=2).min(1) / photos.spacing
     print(f"photos={photos.n} path_frames={len(path)} median_spacing={photos.spacing:.4f} (scene units)")
+    print(f"{len(pieces)} continuous pieces (first frames {[a for a, _ in pieces]}), so {len(pieces) - 1} jump{'s' * (len(pieces) != 2)}"
+          + (f" of {', '.join(f'{j:.1f}' for j in info['jumps_spacings'])} photo spacings" if len(pieces) > 1 else ""))
     print(f"path camera to nearest photo camera, in spacings: mean {nearest.mean():.2f} max {nearest.max():.2f}")
     if len(path) == photos.n:
         angle = np.degrees(np.linalg.norm((Rotation.from_matrix(path[:, :3, :3])

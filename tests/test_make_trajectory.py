@@ -203,6 +203,32 @@ class TravelModeTest(unittest.TestCase):
             self.assertEqual(json.load(open(capped))["frames"], all_frames[::3])
             self.assertEqual(json.load(open(capped.with_name("capped_info.json")))["frame_stride"], 3)
 
+    def test_a_gap_in_the_photos_makes_two_pieces(self):
+        photos = np.concatenate([ring(20, 1.6, 1.2, [0, 0.7, 0], arc=(0, 0.5 * np.pi)),
+                                 ring(20, 1.6, 1.2, [0, 0.7, 0], arc=(np.pi, 1.5 * np.pi))])  # a jump after photo 19
+        with tempfile.TemporaryDirectory() as tmp:
+            write_scene(tmp, Room(), photos)
+            for extra, pieces in (([], [[0, 19], [20, 39]]), (["--max_frames", "15"], [[0, 6], [7, 13]])):
+                out = Path(tmp) / "traj.json"
+                self.assertEqual(mt.main(["--transforms", f"{tmp}/transforms.json", "--output", str(out)] + extra), 0)
+                info = json.load(open(out.with_name("traj_info.json")))
+                self.assertEqual(info["pieces"], pieces)
+                self.assertEqual(len(info["jumps_spacings"]), 1)
+                self.assertGreater(info["jumps_spacings"][0], 4)
+
+
+    def test_phase_offset_shifts_the_weave(self):
+        photos = ring(40, 1.6, 1.2, [0, 0.7, 0])
+        with tempfile.TemporaryDirectory() as tmp:
+            write_scene(tmp, Room(), photos)
+            paths = {}
+            for offset in ("0", "0.5", "1"):
+                out = Path(tmp) / f"traj{offset}.json"
+                self.assertEqual(mt.main(["--transforms", f"{tmp}/transforms.json", "--output", str(out), "--phase_offset", offset]), 0)
+                paths[offset] = np.array([f["transform_matrix"] for f in json.load(open(out))["frames"]])
+            self.assertGreater(np.abs(paths["0.5"] - paths["0"]).max(), 0.01)
+            np.testing.assert_allclose(paths["1"], paths["0"], atol=1e-9)  # a whole period later: the same path
+
 
 class OrbitPoseTest(unittest.TestCase):
     def test_anchor_stays_centred_and_level(self):
@@ -288,6 +314,8 @@ class VidsplatModeTest(unittest.TestCase):
             self.assertEqual(len(frames), 1 + L * len(clips))
             self.assertEqual([c["seed_index"] for c in clips], sorted(c["seed_index"] for c in clips))
             np.testing.assert_allclose(frames[0], photos[clips[0]["seed_index"]])
+            self.assertEqual(info["pieces"], [[0, L]] + [[1 + L * c, L * (c + 1)] for c in range(1, len(clips))])
+            self.assertEqual(len(info["jumps_spacings"]), len(clips) - 1)
             for c_i, clip in enumerate(clips):
                 start = 1 + L * c_i
                 self.assertEqual(start % 4, 1)  # never shares a 4-frame VAE group with the previous clip
@@ -303,6 +331,21 @@ class VidsplatModeTest(unittest.TestCase):
                     "--checkpoint", f"{tmp}/ckpt.pt", "--clearance", "0.3", "--metric_scale", "1.0", "--budget", "97"]
             self.assertEqual(mt.main(argv, renderer=(self.ROOM.render, INTR)), 0)
             self.assertEqual(again.read_text(), out.read_text())
+
+    def test_seen_views_count_as_observed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out, info, photos = self.run_mode(tmp, ["--budget", "97"])
+            self.assertEqual(code, 0)
+            first = {(c["seed_index"], c["direction"], c["extent_deg"]) for c in info["clips"]}
+            again = Path(tmp) / "round2.json"
+            argv = ["--transforms", f"{tmp}/transforms.json", "--output", str(again), "--mode", "vidsplat",
+                    "--checkpoint", f"{tmp}/ckpt.pt", "--clearance", "0.3", "--metric_scale", "1.0", "--budget", "97",
+                    "--seen_transforms", str(out), "--min_clips", "0"]
+            self.assertEqual(mt.main(argv, renderer=(self.ROOM.render, INTR)), 0)
+            info2 = json.loads(again.with_name("round2_info.json").read_text())
+            second = {(c["seed_index"], c["direction"], c["extent_deg"]) for c in info2["clips"]}
+            self.assertFalse(first & second, "round 2 repeated an orbit whose views are already seen")
+            self.assertGreater(info2["rejected"]["nothing_new"], info["rejected"]["nothing_new"])
 
     def test_fails_loudly(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -338,6 +381,21 @@ class ObjectModeTest(unittest.TestCase):
             self.assertLessEqual(info["collapsed_share"], 0.5)
             path = np.array([f["transform_matrix"] for f in json.load(open(out))["frames"]])
             self.assertEqual(len(path), len(photos))
+
+    def test_photos_close_to_walls_move_no_closer(self):
+        photos = ring(60, 2.85, 1.85, [0, 0.5, 0])  # 9 photos within the clearance of the walls x = +-3
+        room = Room(x=(-3, 3), z=(-2.3, 2.3))
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out, info = self.run_mode(tmp, room, photos)
+            self.assertEqual(code, 0, info.get("failed"))
+            self.assertGreater(info["base_cameras_touching"], 0)
+            self.assertLessEqual(info["collapsed_share"], 0.25)
+
+            def wall_distance(p):
+                return np.minimum.reduce([p[:, 0] + 3, 3 - p[:, 0], p[:, 2] + 2.3, 2.3 - p[:, 2]])
+
+            path = np.array([f["transform_matrix"] for f in json.load(open(out))["frames"]])
+            self.assertGreaterEqual(wall_distance(path[:, :3, 3]).min(), 0.9 * wall_distance(photos[:, :3, 3]).min())
 
     def test_existing_extraction_without_hit_count(self):
         photos = ring(60, 2.75, 1.8, [0, 0.5, 0])

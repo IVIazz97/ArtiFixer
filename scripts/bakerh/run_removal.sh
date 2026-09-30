@@ -48,6 +48,10 @@
 #                     travel and TRAJ_UP (0.5) up, keeping the photo rotations.
 # PREVIEW=1 stops after the path and its 3DGUT renders (phases [vobject,] vprep, vdebug: top view +
 # debug/0_debug.mp4), to check a path before ArtiFixer runs (preview_trajectories.sh does all nine).
+# VARIANT loop_object / loop_vidsplat / loop_travel runs LOOP_ROUNDS (3) rounds of that path type, each
+# on the previous round's model, distilling photos + every fixed frame so far (see "Loop" further down;
+# run_loop.sh runs loop_vidsplat on TA_BLUE_MOTOR, PCV and TA_TURBINE). LOOP_STEPS (10000) extra steps
+# per round, LOOP_DISTILL=continue|scratch.
 # VARIANT vanilla_object / vanilla_vidsplat / vanilla_travel sets TRAJ_MODE and writes to its own
 # directory (run_trajectories.sh runs all three on TA_BLUE_MOTOR, PCV and TA_TURBINE). TRAJ_MAX_FRAMES
 # caps the path length (object/travel: every k-th frame) for scenes with many photos.
@@ -133,13 +137,15 @@ esac
 case $VARIANT in
   normal)  HOLE_SHAPE=${HOLE_SHAPE:-mask}; DILATE=${DILATE:-12} ;;
   bighull) HOLE_SHAPE=${HOLE_SHAPE:-hull}; DILATE=${DILATE:-80} ;;
+  loop_object|loop_vidsplat|loop_travel) HOLE_SHAPE=none; DILATE=0; TRAJ_MODE=${VARIANT#loop_}
+    [ "$S" != Compressor ] || { echo "the loop is for TA_BLUE_MOTOR, PCV and TA_TURBINE only" >&2; exit 2; } ;;
   vanilla|vanilla_object|vanilla_vidsplat|vanilla_travel) HOLE_SHAPE=none; DILATE=0
     # vanilla_<mode> fixes TRAJ_MODE and has its own output dir, so the three paths can sit side by side.
     [ "$VARIANT" = vanilla ] || TRAJ_MODE=${VARIANT#vanilla_}
     # One path frame per photo: all 923 Compressor photos would not fit through ArtiFixer.
     [ "$S" != Compressor ] || { echo "vanilla is for TA_BLUE_MOTOR, PCV and TA_TURBINE only" >&2; exit 2; } ;;
   i360|af360|i360sam|af360sam) HOLE_SHAPE=none; DILATE=0; export HF_HUB_OFFLINE=1 ;;
-  *) echo "unknown VARIANT '$VARIANT' (normal, bighull, vanilla, vanilla_object, vanilla_vidsplat, vanilla_travel, i360, af360, i360sam, af360sam)" >&2; exit 2 ;;
+  *) echo "unknown VARIANT '$VARIANT' (normal, bighull, vanilla, vanilla_object, vanilla_vidsplat, vanilla_travel, loop_object, loop_vidsplat, loop_travel, i360, af360, i360sam, af360sam)" >&2; exit 2 ;;
 esac
 TRAJ_MODE=${TRAJ_MODE:-object}
 case $TRAJ_MODE in object|vidsplat|travel) ;; *) echo "unknown TRAJ_MODE '$TRAJ_MODE' (object, vidsplat, travel)" >&2; exit 2 ;; esac
@@ -158,6 +164,9 @@ TRAJ_S_LOW=${TRAJ_S_LOW:-0.03}
 TRAJ_S_HIGH=${TRAJ_S_HIGH:-0.4}
 TRAJ_BUDGET=${TRAJ_BUDGET:-}
 TRAJ_MAX_FRAMES=${TRAJ_MAX_FRAMES:-}
+LOOP_ROUNDS=${LOOP_ROUNDS:-3}
+LOOP_STEPS=${LOOP_STEPS:-10000}
+LOOP_DISTILL=${LOOP_DISTILL:-continue}
 # Baselines: local model folders (no Hugging Face on the VM) and the AuraFusion360 2D-model venv.
 MODELS=${MODELS:-/workspace/amazzucchelli/fbk-3dworld/models}
 LAMA=${LAMA:-$MODELS/LaMa/big-lama.pt}
@@ -189,6 +198,10 @@ USER_PHASES=${PHASES:-}
 if [ -z "${PHASES:-}" ] && [[ $VARIANT == vanilla* ]]; then
   PHASES=vprep,vinfer,vaf3d,vaf3dplus
   [ -z "${PREVIEW:-}" ] || PHASES=vprep,vdebug  # only the path and its 3DGUT renders, no ArtiFixer
+  [ "$TRAJ_MODE" != object ] || PHASES=vobject,$PHASES
+elif [ -z "${PHASES:-}" ] && [[ $VARIANT == loop_* ]]; then
+  PHASES=vloopplus
+  for ((k = LOOP_ROUNDS; k >= 1; k--)); do PHASES=vround$k,$PHASES; done
   [ "$TRAJ_MODE" != object ] || PHASES=vobject,$PHASES
 elif [ -z "${PHASES:-}" ] && [ "$VARIANT" = i360 ]; then
   PHASES=flashsplat,views,i360remove,i360virtual,i360nbs,i360lama,i360init,i360finetune
@@ -224,7 +237,7 @@ fi
 
 missing=()
 needed=("$PY" "$CKPT" "$CHECKPOINT_PT" "$MODEL_ID" "$COLMAP")
-[[ $VARIANT == vanilla* ]] || needed+=("${MASK_DIR:-<MASK_DIR: no masks_npy under $SAM_MASKS/$S>}")
+[[ $VARIANT == vanilla* || $VARIANT == loop_* ]] || needed+=("${MASK_DIR:-<MASK_DIR: no masks_npy under $SAM_MASKS/$S>}")
 case $VARIANT in
   i360)           needed+=("$LAMA") ;;
   i360sam)        needed+=("$LAMA" "$AF_PY") ;;
@@ -413,27 +426,67 @@ phase_vobject() {
       --test_split_interval -1 --config_override selected_indices_file=null
 }
 
+metric_scale() {  # metres per scene unit of the scene, if known (empty, not an error, when it is not)
+  [ -f "$SR/metric_alignment/scale_info.txt" ] || return 0
+  sed -n 's/^Scale factor: *\([^ ]*\).*/\1/p' "$SR/metric_alignment/scale_info.txt" | head -1
+}
+
+prepare_photos() {  # prepare_photos ROOT CHECKPOINT: prepared scene root (photos, transforms) over CHECKPOINT
+  local prep=("$PY" -m data_processing.prepare_colmap_artifixer_inputs --colmap_dir "$COLMAP" --output_root "$1"
+              --reconstruction_checkpoint "$2" --reconstruction_steps 30000 ${FORCE:+--replace})
+  "${prep[@]}" --phases prepare
+}
+
+render_path() {  # render_path ROOT CHECKPOINT TRAJECTORY: caption, then photos and path rendered with CHECKPOINT
+  local root=$1 ckpt=$2 trajectory=$3 scale caption=$1/captions/$S/caption.h5 src=""
+  scale=$(metric_scale)
+  if [ -f "$SR/split.json" ]; then
+    src=$("$PY" -c 'import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+entry = next(iter(json.loads((root / "split.json").read_text())["test"].values()))
+print((root / entry["prompt_path"]).resolve())' "$SR")
+  fi
+  mkdir -p "$(dirname "$caption")"
+  if [ -n "$src" ] && [ -f "$src" ]; then
+    echo "caption from $src"
+    cp -L "$src" "$caption"
+  else
+    echo "caption: $SCENE_CAPTION"
+    "$PY" output/jobs/write_caption.py --caption "$SCENE_CAPTION" --output_path "$caption" --text_encoder_model_id "$MODEL_ID"
+  fi
+  "$PY" -m data_processing.prepare_colmap_artifixer_inputs --colmap_dir "$COLMAP" --output_root "$root" \
+      --reconstruction_checkpoint "$ckpt" --reconstruction_steps 30000 ${FORCE:+--replace} \
+      --phases render,scale --trajectory_path "$trajectory" ${scale:+--metric_scale "$scale"}
+  [ -f "$root/split.json" ] || { echo "prepare wrote no $root/split.json (trajectory renders incomplete?)"; return 1; }
+}
+
+build_traj_args() {  # build_traj_args CHECKPOINT: make_trajectory.py arguments for TRAJ_MODE, in TRAJ_ARGS
+  local scale labels
+  scale=$(metric_scale)
+  TRAJ_ARGS=(--checkpoint "$1" --clearance_m "$TRAJ_CLEARANCE_M" --d0_m "$TRAJ_D0_M" ${scale:+--metric_scale "$scale"}
+             ${TRAJ_MAX_FRAMES:+--max_frames "$TRAJ_MAX_FRAMES"})
+  case $TRAJ_MODE in
+    object)
+      labels=$(object_labels)
+      [ -n "$labels" ] || { echo "no FlashSplat labels for $S (vobject should have made them)"; return 1; }
+      TRAJ_ARGS+=(--mode object --flashsplat_dir "$labels" --orbit "$TRAJ_ORBIT" --radial "$TRAJ_RADIAL" --rise "$TRAJ_RISE")
+      [ "$TRAJ_RENDER_CHECK" = 0 ] || TRAJ_ARGS+=(--render_check --colmap_dir "$COLMAP")
+      [ "$TRAJ_ALLOW_FALLBACK" = 0 ] || TRAJ_ARGS+=(--allow_fallback) ;;
+    vidsplat)
+      TRAJ_ARGS+=(--mode vidsplat --colmap_dir "$COLMAP" --clip_len "$TRAJ_CLIP" --orbit_deg "$TRAJ_ORBIT_DEG"
+                  --s_low "$TRAJ_S_LOW" --s_high "$TRAJ_S_HIGH" ${TRAJ_BUDGET:+--budget "$TRAJ_BUDGET"}) ;;
+    travel)
+      TRAJ_ARGS+=(--mode travel --side "$TRAJ_SIDE" --up "$TRAJ_UP") ;;
+  esac
+}
+
 phase_vprep() {
   # Prepared root $V with the photos as anchors and the novel path as targets, rendered from the
   # existing 3DGUT checkpoint (no reconstruction). Caption and metric scale come from the scene.
   local scale
-  scale=$(sed -n 's/^Scale factor: *\([^ ]*\).*/\1/p' "$SR/metric_alignment/scale_info.txt" 2>/dev/null | head -1)
-  local traj=(--checkpoint "$CKPT" --clearance_m "$TRAJ_CLEARANCE_M" --d0_m "$TRAJ_D0_M" ${scale:+--metric_scale "$scale"}
-              ${TRAJ_MAX_FRAMES:+--max_frames "$TRAJ_MAX_FRAMES"})
-  case $TRAJ_MODE in
-    object)
-      local labels
-      labels=$(object_labels)
-      [ -n "$labels" ] || { echo "no FlashSplat labels for $S (vobject should have made them)"; return 1; }
-      traj+=(--mode object --flashsplat_dir "$labels" --orbit "$TRAJ_ORBIT" --radial "$TRAJ_RADIAL" --rise "$TRAJ_RISE")
-      [ "$TRAJ_RENDER_CHECK" = 0 ] || traj+=(--render_check --colmap_dir "$COLMAP")
-      [ "$TRAJ_ALLOW_FALLBACK" = 0 ] || traj+=(--allow_fallback) ;;
-    vidsplat)
-      traj+=(--mode vidsplat --colmap_dir "$COLMAP" --clip_len "$TRAJ_CLIP" --orbit_deg "$TRAJ_ORBIT_DEG"
-             --s_low "$TRAJ_S_LOW" --s_high "$TRAJ_S_HIGH" ${TRAJ_BUDGET:+--budget "$TRAJ_BUDGET"}) ;;
-    travel)
-      traj+=(--mode travel --side "$TRAJ_SIDE" --up "$TRAJ_UP") ;;
-  esac
+  scale=$(metric_scale)
+  build_traj_args "$CKPT" || return 1
+  local traj=("${TRAJ_ARGS[@]}")
   # The path is redone when its settings change: a stale split.json would silently keep the old one.
   local settings
   settings=$(printf '%s\n' "${traj[@]}")
@@ -450,34 +503,13 @@ phase_vprep() {
       [ ! -e "$f" ] || mv "$f" "$old/"
     done
   fi
-  local prep=("$PY" -m data_processing.prepare_colmap_artifixer_inputs --colmap_dir "$COLMAP" --output_root "$V"
-              --reconstruction_checkpoint "$CKPT" --reconstruction_steps 30000 ${FORCE:+--replace})
-  "${prep[@]}" --phases prepare
-
+  prepare_photos "$V" "$CKPT"
   echo "metric scale: ${scale:-<none in $SR/metric_alignment: estimating with MoGe; clearance from the object size>}"
   echo "trajectory: $TRAJ_MODE"
   "$PY" scripts/bakerh/make_trajectory.py --transforms "$V/3dgrut_input/$S/nerfstudio/transforms.json" \
       --output "$O/trajectory_input.json" "${traj[@]}" \
     || { echo "make_trajectory.py found no acceptable $TRAJ_MODE path: see $O/trajectory_input_info.json and $O/trajectory_input.png"; return 1; }
-
-  local caption=$V/captions/$S/caption.h5 src=""
-  if [ -f "$SR/split.json" ]; then
-    src=$("$PY" -c 'import json, pathlib, sys
-root = pathlib.Path(sys.argv[1])
-entry = next(iter(json.loads((root / "split.json").read_text())["test"].values()))
-print((root / entry["prompt_path"]).resolve())' "$SR")
-  fi
-  mkdir -p "$(dirname "$caption")"
-  if [ -n "$src" ] && [ -f "$src" ]; then
-    echo "caption from $src"
-    cp -L "$src" "$caption"
-  else
-    echo "caption: $SCENE_CAPTION"
-    "$PY" output/jobs/write_caption.py --caption "$SCENE_CAPTION" --output_path "$caption" --text_encoder_model_id "$MODEL_ID"
-  fi
-
-  "${prep[@]}" --phases render,scale --trajectory_path "$O/trajectory_input.json" ${scale:+--metric_scale "$scale"}
-  [ -f "$V/split.json" ] || { echo "prepare wrote no $V/split.json (trajectory renders incomplete?)"; return 1; }
+  render_path "$V" "$CKPT" "$O/trajectory_input.json"
   echo "$settings" > "$O/trajectory_input.args"
 }
 
@@ -488,6 +520,145 @@ debug_videos() {  # best effort: $O/debug/0_debug.mp4 (path top view | render | 
 
 phase_vdebug() {
   debug_videos
+}
+
+# Loop (loop_<mode>): LOOP_ROUNDS rounds, each adding a new path of TRAJ_MODE to the reconstruction.
+# Round k: the path is chosen on the round k-1 model (vidsplat counts every earlier generated view as
+# seen; object/travel shift their weave by (k-1)/LOOP_ROUNDS of a period), all paths so far are
+# rendered with that model, ArtiFixer fixes only the new frames, and ArtiFixer3D distills photos +
+# every fixed frame so far into the round k model (round 1 from scratch, later rounds continue the
+# previous model for LOOP_STEPS more steps; LOOP_DISTILL=scratch retrains each round). Each round gets
+# 1/LOOP_ROUNDS of the frame budget. A later round that finds no acceptable new path ends the loop.
+# vloopplus runs ArtiFixer3D+ over all paths with the last model. Outputs: $O/round_<k>/, $O/final.
+loop_round() {
+  local k=$1 R=$O/round_$1 prev=$O/round_$(($1 - 1)) base steps first per_round n_photos offset pred i
+  local C=$R/$S
+  if [ -f "$O/loop_ended" ] && [ "$(cat "$O/loop_ended")" -le "$k" ]; then
+    echo "the loop ended at round $(cat "$O/loop_ended") (no acceptable new path): nothing to do"
+    return 0
+  fi
+  if [ -z "${FORCE:-}" ] && [ -f "$R/model.txt" ] && [ -f "$(cat "$R/model.txt")" ]; then
+    echo "round $k done: model $(cat "$R/model.txt")"
+    return 0
+  fi
+  if [ "$k" -eq 1 ]; then base=$CKPT; else base=$(cat "$prev/model.txt"); fi
+  echo "round $k/$LOOP_ROUNDS: paths chosen and rendered with $base"
+  mkdir -p "$R"
+  prepare_photos "$C" "$base"
+  n_photos=$("$PY" -c 'import json, sys; print(len(json.load(open(sys.argv[1]))["frames"]))' \
+      "$C/3dgrut_input/$S/nerfstudio/transforms.json")
+  per_round=$(( ${TRAJ_MAX_FRAMES:-$n_photos} / LOOP_ROUNDS ))
+  [ "$per_round" -ge $((TRAJ_CLIP + 1)) ] || per_round=$((TRAJ_CLIP + 1))
+  offset=$("$PY" -c "print(($k - 1) / $LOOP_ROUNDS)")
+  build_traj_args "$base" || return 1
+  local seen=()
+  [ "$k" -eq 1 ] || seen=(--seen_transforms "$prev/trajectory_input.json")
+  if ! "$PY" scripts/bakerh/make_trajectory.py --transforms "$C/3dgrut_input/$S/nerfstudio/transforms.json" \
+      --output "$R/new_path.json" "${TRAJ_ARGS[@]}" --max_frames "$per_round" --phase_offset "$offset" \
+      ${seen[@]+"${seen[@]}"}; then
+    if [ "$k" -eq 1 ]; then
+      echo "round 1 found no acceptable $TRAJ_MODE path: see $R/new_path_info.json and $R/new_path.png"
+      return 1
+    fi
+    echo "round $k found no acceptable new path (see $R/new_path_info.json): the loop ends with round $((k - 1))"
+    echo "$k" > "$O/loop_ended"
+    return 0
+  fi
+  # All paths so far, the new one last: ArtiFixer fixes the new block, ArtiFixer3D distills them all.
+  first=$("$PY" - "$R" "$prev" "$k" <<'PYEOF'
+import json, shutil, sys
+from pathlib import Path
+R, prev, k = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3])
+new = json.loads((R / "new_path.json").read_text())
+old = json.loads((prev / "trajectory_input.json").read_text())["frames"] if k > 1 else []
+new["frames"] = old + new["frames"]
+(R / "trajectory_input.json").write_text(json.dumps(new, indent=2) + "\n")
+info = json.loads((R / "new_path_info.json").read_text())
+# Pieces of the whole path: every earlier round's, then the new round's after the offset.
+before = json.loads((prev / "trajectory_input_info.json").read_text()).get("pieces") if k > 1 else []
+before = before or ([[0, len(old) - 1]] if old else [])
+info["pieces"] = before + [[a + len(old), b + len(old)] for a, b in info.get("pieces") or [[0, len(new["frames"]) - len(old) - 1]]]
+info.update(frame_offset=len(old), loop_round=k)
+(R / "trajectory_input_info.json").write_text(json.dumps(info, indent=1) + "\n")
+if (R / "new_path.png").exists():
+    shutil.copy(R / "new_path.png", R / "trajectory_input.png")
+print(len(old))
+PYEOF
+)
+  render_path "$C" "$base" "$R/trajectory_input.json"
+  "$PY" - "$C" "$first" <<'PYEOF'
+import json, sys
+from pathlib import Path
+root, first = Path(sys.argv[1]), int(sys.argv[2])
+split = json.loads((root / "split.json").read_text())
+(scene, entry), = split["test"].items()
+targets = json.loads((root / entry["target_indices_path"]).read_text())
+new = [t for t in targets if t >= first]
+assert new == list(range(first, first + len(new))) and new, f"new frames {first}.. are not the last targets"
+(root / "target_indices_round.json").write_text(json.dumps(new) + "\n")
+entry["target_indices_path"] = str((root / "target_indices_round.json").resolve())
+(root / "split_round.json").write_text(json.dumps(split, indent=2) + "\n")
+print(f"ArtiFixer on frames {first}-{first + len(new) - 1} of {len(targets)}")
+PYEOF
+  "$PY" -m model_eval.run_inference --evalset reconstructed_colmap \
+      --checkpoint_pt "$CHECKPOINT_PT" --model_id "$MODEL_ID" \
+      --save_dir "$R/artifixer" --split_path "$C/split_round.json" --render_trajectory trajectory \
+      --num_views "$NUM_VIEWS" "${MEM_ARGS[@]}" --replace_if_exists
+  pred=$(pred_dir "$R/artifixer")
+  [ -n "$pred" ] || { echo "no ArtiFixer output under $R/artifixer"; return 1; }
+  rm -rf "$R/pred_all"
+  mkdir -p "$R/pred_all"
+  if [ "$k" -gt 1 ]; then
+    for i in "$prev"/pred_all/*.png; do ln -s "$(readlink -f "$i")" "$R/pred_all/$(basename "$i")"; done
+  fi
+  for i in "$pred"/*.png; do ln -sfn "$(readlink -f "$i")" "$R/pred_all/$(basename "$i")"; done
+  local distill=()
+  if [ "$k" -eq 1 ] || [ "$LOOP_DISTILL" = scratch ]; then
+    steps=$AF3D_STEPS
+  else
+    steps=$(( $("$PY" -c 'import sys, torch; print(int(torch.load(sys.argv[1], map_location="cpu", weights_only=False)["global_step"]))' "$base") + LOOP_STEPS ))
+    distill=(--base_checkpoint "$base")
+  fi
+  echo "ArtiFixer3D: photos + $(ls "$R/pred_all" | wc -l) fixed frames, $([ ${#distill[@]} -gt 0 ] && echo "continuing $base to step $steps" || echo "from scratch, $steps steps")"
+  "$PY" -m data_processing.run_artifixer3d --scene_root "$C" --artifixer_frames_dir "$R/pred_all" \
+      --output_root "$R/artifixer3d" --artifixer3d_steps "$steps" --phases distill ${FORCE:+--replace} \
+      ${distill[@]+"${distill[@]}"}
+  local model
+  model=$(find "$R/artifixer3d" -name "ckpt_${steps}.pt" | head -1)
+  [ -n "$model" ] || { echo "ArtiFixer3D wrote no ckpt_${steps}.pt under $R/artifixer3d"; return 1; }
+  echo "$model" > "$R/model.txt"
+  "$PY" scripts/bakerh/debug_video.py --variant_dir "$R" --scene "$S" \
+    || echo "WARNING: debug video failed; the run goes on"
+}
+
+phase_vloopplus() {
+  # ArtiFixer3D+ over every path of the loop, rendered with the last round's model.
+  local k R="" C model steps done_pred
+  for k in $(seq "$LOOP_ROUNDS" -1 1); do
+    if [ -f "$O/round_$k/model.txt" ]; then R=$O/round_$k; break; fi
+  done
+  [ -n "$R" ] || { echo "no finished loop round under $O"; return 1; }
+  C=$R/$S
+  model=$(cat "$R/model.txt")
+  steps=$(basename "$model" .pt)
+  steps=${steps#ckpt_}
+  ln -sfn "$(basename "$R")" "$O/final"
+  done_pred=$(pred_dir "$R/af3d_plus")
+  if [ -z "${FORCE:-}" ] && [ -n "$done_pred" ] && [ "$done_pred" -nt "$model" ]; then
+    echo "found $done_pred (newer than the final model)"
+  else
+    echo "ArtiFixer3D+ with $model over $(ls "$R/pred_all" | wc -l) path frames"
+    "$PY" -m data_processing.run_artifixer3d --scene_root "$C" --output_root "$R/artifixer3d" \
+        --artifixer3d_steps "$steps" --phases render,prepare_artifixer3d_plus
+    "$PY" -m model_eval.run_inference --evalset reconstructed_colmap \
+        --checkpoint_pt "$CHECKPOINT_PT" --model_id "$MODEL_ID" \
+        --save_dir "$R/af3d_plus" --split_path "$C/split_artifixer3d_plus.json" --render_trajectory trajectory \
+        --num_views "$NUM_VIEWS" "${MEM_ARGS[@]}" --replace_if_exists
+  fi
+  done_pred=$(pred_dir "$R/af3d_plus")
+  "$PY" scripts/bakerh/debug_video.py --variant_dir "$R" --scene "$S" --first_frame 0 --pred_dir "$R/pred_all" \
+      --render_dir "$(dirname "$done_pred")/rendered" --out_dir "$O/debug" \
+    || echo "WARNING: debug video failed; the run goes on"
 }
 
 phase_vinfer() {
@@ -656,6 +827,7 @@ phase_affinetune() {
 } > "$LOG_DIR/00_config.log"
 note "RUN $STAMP   phases=$PHASES   gpu=$GPU   config: $LOG_DIR/00_config.log"
 
+for ((k = 1; k <= LOOP_ROUNDS; k++)); do eval "phase_vround$k() { loop_round $k; }"; done
 IFS=, read -ra phase_list <<< "$PHASES"
 for p in "${phase_list[@]}"; do
   declare -F "phase_$p" > /dev/null || { echo "unknown phase '$p'" >&2; exit 2; }

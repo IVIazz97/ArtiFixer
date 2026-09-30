@@ -27,9 +27,10 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 AF=$(cd "$HERE/../.." && pwd)
 SCENES=${SCENES:-"TA_BLUE_MOTOR PCV TA_TURBINE"}
 MODES=${MODES:-"object vidsplat travel"}
+PREFIX=${PREFIX:-vanilla}  # run_loop.sh: loop
 if [ -z "${JOBS:-}" ]; then
   JOBS=""
-  for s in $SCENES; do for m in $MODES; do JOBS="$JOBS $s:vanilla_$m"; done; done
+  for s in $SCENES; do for m in $MODES; do JOBS="$JOBS $s:${PREFIX}_$m"; done; done
 fi
 export JOBS=${JOBS# }
 
@@ -51,7 +52,7 @@ for s in $(printf '%s\n' $JOBS | cut -d: -f1 | uniq); do
   elif [ -d "$SAM_MASKS/$s/full/masks_npy" ] || [ -d "$SAM_MASKS/$s/0_400/masks_npy" ]; then
     object="SAM masks found (vobject segments the object first)"
   else
-    object="NO labels or SAM masks: vanilla_object will fail (the other modes still run)"
+    object="NO labels or SAM masks: ${PREFIX}_object will fail (the other modes still run)"
   fi
   scale=$(sed -n 's/^Scale factor: *\([^ ]*\).*/\1/p' "$sr/metric_alignment/scale_info.txt" 2>/dev/null | head -1)
   printf '  %-14s checkpoint %-8s photos %-5s metric scale %-10s object: %s\n' "$s" \
