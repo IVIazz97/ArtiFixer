@@ -111,12 +111,13 @@ MASKS=/workspace/amazzucchelli/fbk-3dworld/FlashSplat/sam3_single_object_anchor_
 for p in "$PY" "$AF/checkpoints/ArtiFixer/artifixer-1.3b.pt" "$AF/checkpoints/Wan2.1-T2V-1.3B-Diffusers/text_encoder" \
          "$AF/output/bakerh_undis/TA_BLUE_MOTOR/3dgrut_runs/TA_BLUE_MOTOR/TA_BLUE_MOTOR/ours_30000/ckpt_30000.pt" \
          "$AF/output/bakerh_undis/PCV/3dgrut_runs/PCV/PCV/ours_30000/ckpt_30000.pt" \
+         "$AF/output/bakerh_undis/TA_TURBINE/3dgrut_runs/TA_TURBINE/TA_TURBINE/ours_30000/ckpt_30000.pt" \
          "$AF/output/bakerh_undis_ds2_from1600/Compressor/3dgrut_runs/Compressor/Compressor/ours_30000/ckpt_30000.pt" \
          "$AF/output/bakerh_undis_ds2_from1600/Compressor/split.json" \
          "$AF/output/bakerh_undis_ds2_from1600/Compressor/flashsplat_out_per_view_norm_gt0p1_hull_trim995/hit_count.pt"; do
   check "$p"
 done
-for s in TA_BLUE_MOTOR PCV Compressor; do
+for s in TA_BLUE_MOTOR PCV TA_TURBINE Compressor; do
   for sub in full 0_400; do
     d=$MASKS/$s/$sub/masks_npy
     if [ -d "$d" ]; then echo "  ok       $d ($(find "$d" -name '*.npy' | wc -l) masks)"; else echo "  absent   $d"; fi >> "$REPORT"

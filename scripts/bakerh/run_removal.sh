@@ -27,14 +27,39 @@
 #   SEEDS=auto   seeds = the first 7 frames of each frame window (also runs part 1 if missing)
 # PHASES=split,infer reruns only those phases. FORCE=1 redoes prep and flashsplat even when done.
 #
-# Vanilla (phases vprep, vinfer, vaf3d, vaf3dplus): make_trajectory.py builds a smooth path, one
-# camera per photo, weaving TRAJ_SIDE (2) median photo spacings to either side of the photo path
-# (across the direction of travel) and TRAJ_UP (0.5) spacings above it. vprep renders it with the
-# existing 3DGUT model into a prepared root (every photo is a real anchor, every path frame a
-# target; caption and metric scale reused from the scene), vinfer fixes the path renders with the
-# photos as references, vaf3d distills photos + fixed frames into a new 3DGUT, vaf3dplus runs
-# ArtiFixer again on its path renders.
-# FORCE=1 redoes vprep and vinfer even when done.
+# Vanilla (phases [vobject,] vprep, vinfer, vaf3d, vaf3dplus): make_trajectory.py builds the novel
+# path, TRAJ_MODE:
+#   object (default)  one camera per photo on the smoothed photo path, orbiting the object's centre of
+#                     mass (FlashSplat object Gaussians, weighted by opacity; vobject segments them if
+#                     no labels exist yet) by up to TRAJ_ORBIT (0.6) object radii, toward/away by
+#                     TRAJ_RADIAL (0.3) and up by TRAJ_RISE (0.3) radii, looking at the object. Fails
+#                     the phase when walls leave no room (more than half the frames collapse onto the
+#                     photos); TRAJ_ALLOW_FALLBACK=1 accepts that. TRAJ_RENDER_CHECK=1 also renders
+#                     every frame and rejects views a near surface blocks.
+#   vidsplat          VidSplat-style (SIGGRAPH 2026) short orbits: for seed photos over the capture, a
+#                     TRAJ_CLIP (16) frame orbit about the surface point the photo looks at, the
+#                     direction and extent (TRAJ_ORBIT_DEG 15,30,45) that reveal the most unseen
+#                     surface while no keyframe shows more than TRAJ_S_HIGH (0.4) unseen area, none is
+#                     blocked by a surface closer than TRAJ_D0_M (0.5) m, and the last shows at least
+#                     TRAJ_S_LOW (0.03) more than the photo. TRAJ_BUDGET frames in all (default one per
+#                     photo, at most TRAJ_MAX_FRAMES). Fails the phase when fewer than half the
+#                     orbits are valid.
+#   travel            the earlier weave: TRAJ_SIDE (2) median photo spacings across the direction of
+#                     travel and TRAJ_UP (0.5) up, keeping the photo rotations.
+# PREVIEW=1 stops after the path and its 3DGUT renders (phases [vobject,] vprep, vdebug: top view +
+# debug/0_debug.mp4), to check a path before ArtiFixer runs (preview_trajectories.sh does all nine).
+# VARIANT vanilla_object / vanilla_vidsplat / vanilla_travel sets TRAJ_MODE and writes to its own
+# directory (run_trajectories.sh runs all three on TA_BLUE_MOTOR, PCV and TA_TURBINE). TRAJ_MAX_FRAMES
+# caps the path length (object/travel: every k-th frame) for scenes with many photos.
+# Every mode checks the 3DGUT Gaussians: no path camera comes closer than TRAJ_CLEARANCE_M (0.3) metres
+# to a surface or crosses a wall; object/travel cameras that would are pulled back toward the photo
+# path. Top view of walls, object and path: $O/trajectory_input.png, details (rejections, per-orbit
+# stats, failure reason): $O/trajectory_input_info.json. vprep renders the path with the existing 3DGUT
+# model into a prepared root (every photo is a real anchor, every path frame a target; caption and
+# metric scale reused from the scene), vinfer fixes the path renders with the photos as references,
+# vaf3d distills photos + fixed frames into a new 3DGUT, vaf3dplus runs ArtiFixer again on its path
+# renders. Changing a TRAJ_* knob redoes the path and ArtiFixer (the old outputs move to
+# $O/previous/<timestamp>/); FORCE=1 redoes vprep and vinfer regardless.
 #
 # Baselines (i360, af360): both remove the same FlashSplat object as the ArtiFixer runs (labels,
 # contribution and hit count from FS_SRC, else from the flashsplat phase). With FRAMES they run on
@@ -44,14 +69,14 @@
 # af360 2D stages run in .venv_af2d. Final renders of every view: <variant>/final/rgb.
 # A baseline job whose final model exists for the same views is skipped (FORCE=1 redoes it).
 #
-# Env knobs: GPU (1), NUM_VIEWS (6), DILATE, HOLE_SHAPE, FRAMES, COMPRESSOR_FRAMES, MASK_DIR, SCENE_CAPTION,
+# Env knobs: GPU (1), NUM_VIEWS (6), TRAJ_* (vanilla path, see above), DILATE, HOLE_SHAPE, FRAMES, COMPRESSOR_FRAMES, MASK_DIR, SCENE_CAPTION,
 # EMPTY_CAPTION, METRIC_SCALE, OUTSIDE (photo|render), AF3D_STEPS (30000), PY, SCENE_ROOT, FS_SRC, OUT_ROOT,
 # MODELS, REF_INDEX.
 # Outputs: output/bakerh_removal/<scene>/<variant>/. Logs: .../logs/<timestamp>/NN_<phase>.log and
 # .../logs/summary.log (start, end, duration and peak GPU memory of every phase, across runs).
 set -euo pipefail
-SCENE=${1:?usage: run_removal.sh SCENE VARIANT   (SCENE: TA_BLUE_MOTOR|PCV|Compressor, VARIANT: normal|bighull|vanilla|i360|af360|i360sam|af360sam)}
-VARIANT=${2:?usage: run_removal.sh SCENE VARIANT   (VARIANT: normal|bighull|vanilla|i360|af360|i360sam|af360sam)}
+SCENE=${1:?usage: run_removal.sh SCENE VARIANT   (SCENE: TA_BLUE_MOTOR|PCV|TA_TURBINE|Compressor, VARIANT: normal|bighull|vanilla[_object|_vidsplat|_travel]|i360|af360|i360sam|af360sam)}
+VARIANT=${2:?usage: run_removal.sh SCENE VARIANT   (VARIANT: normal|bighull|vanilla[_object|_vidsplat|_travel]|i360|af360|i360sam|af360sam)}
 AF=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$AF"
 
@@ -94,25 +119,45 @@ case $S in
   PCV)
     SR=${SCENE_ROOT:-$AF/output/bakerh_undis/$S}; FS_SRC=${FS_SRC:-$SR/flashsplat_out}; FRAMES=${FRAMES-}
     SCENE_CAPTION=${SCENE_CAPTION:-"An industrial hall with a large pressure control valve assembly, pipes and flanges standing on the floor."} ;;
+  TA_TURBINE)
+    SR=${SCENE_ROOT:-$AF/output/bakerh_undis/$S}; FS_SRC=${FS_SRC:-$SR/flashsplat_out}; FRAMES=${FRAMES-}
+    SCENE_CAPTION=${SCENE_CAPTION:-"An industrial hall with a large turbine standing on the floor, surrounded by pipes and equipment."} ;;
   Compressor)
     # The ds2 scene already has split.json, caption, metric scale and the tuned FlashSplat labels.
     # Only frames 49-148 and 284-304 go through ArtiFixer: all 923 at once ran out of memory.
     SR=${SCENE_ROOT:-$AF/output/bakerh_undis_ds2_from1600/$S}
     FS_SRC=${FS_SRC:-$SR/flashsplat_out_per_view_norm_gt0p1_hull_trim995}; FRAMES=${FRAMES-${COMPRESSOR_FRAMES-49-148,284-304}}
     SCENE_CAPTION=${SCENE_CAPTION:-} ;;
-  *) echo "unknown SCENE '$S' (TA_BLUE_MOTOR, PCV, Compressor)" >&2; exit 2 ;;
+  *) echo "unknown SCENE '$S' (TA_BLUE_MOTOR, PCV, TA_TURBINE, Compressor)" >&2; exit 2 ;;
 esac
 case $VARIANT in
   normal)  HOLE_SHAPE=${HOLE_SHAPE:-mask}; DILATE=${DILATE:-12} ;;
   bighull) HOLE_SHAPE=${HOLE_SHAPE:-hull}; DILATE=${DILATE:-80} ;;
-  vanilla) HOLE_SHAPE=none; DILATE=0
+  vanilla|vanilla_object|vanilla_vidsplat|vanilla_travel) HOLE_SHAPE=none; DILATE=0
+    # vanilla_<mode> fixes TRAJ_MODE and has its own output dir, so the three paths can sit side by side.
+    [ "$VARIANT" = vanilla ] || TRAJ_MODE=${VARIANT#vanilla_}
     # One path frame per photo: all 923 Compressor photos would not fit through ArtiFixer.
-    [ "$S" != Compressor ] || { echo "vanilla is for TA_BLUE_MOTOR and PCV only" >&2; exit 2; } ;;
+    [ "$S" != Compressor ] || { echo "vanilla is for TA_BLUE_MOTOR, PCV and TA_TURBINE only" >&2; exit 2; } ;;
   i360|af360|i360sam|af360sam) HOLE_SHAPE=none; DILATE=0; export HF_HUB_OFFLINE=1 ;;
-  *) echo "unknown VARIANT '$VARIANT' (normal, bighull, vanilla, i360, af360, i360sam, af360sam)" >&2; exit 2 ;;
+  *) echo "unknown VARIANT '$VARIANT' (normal, bighull, vanilla, vanilla_object, vanilla_vidsplat, vanilla_travel, i360, af360, i360sam, af360sam)" >&2; exit 2 ;;
 esac
+TRAJ_MODE=${TRAJ_MODE:-object}
+case $TRAJ_MODE in object|vidsplat|travel) ;; *) echo "unknown TRAJ_MODE '$TRAJ_MODE' (object, vidsplat, travel)" >&2; exit 2 ;; esac
+TRAJ_ORBIT=${TRAJ_ORBIT:-0.6}
+TRAJ_RADIAL=${TRAJ_RADIAL:-0.3}
+TRAJ_RISE=${TRAJ_RISE:-0.3}
 TRAJ_SIDE=${TRAJ_SIDE:-2}
 TRAJ_UP=${TRAJ_UP:-0.5}
+TRAJ_CLEARANCE_M=${TRAJ_CLEARANCE_M:-0.3}
+TRAJ_D0_M=${TRAJ_D0_M:-0.5}
+TRAJ_RENDER_CHECK=${TRAJ_RENDER_CHECK:-0}
+TRAJ_ALLOW_FALLBACK=${TRAJ_ALLOW_FALLBACK:-0}
+TRAJ_CLIP=${TRAJ_CLIP:-16}
+TRAJ_ORBIT_DEG=${TRAJ_ORBIT_DEG:-15,30,45}
+TRAJ_S_LOW=${TRAJ_S_LOW:-0.03}
+TRAJ_S_HIGH=${TRAJ_S_HIGH:-0.4}
+TRAJ_BUDGET=${TRAJ_BUDGET:-}
+TRAJ_MAX_FRAMES=${TRAJ_MAX_FRAMES:-}
 # Baselines: local model folders (no Hugging Face on the VM) and the AuraFusion360 2D-model venv.
 MODELS=${MODELS:-/workspace/amazzucchelli/fbk-3dworld/models}
 LAMA=${LAMA:-$MODELS/LaMa/big-lama.pt}
@@ -141,8 +186,10 @@ pred_dir() {  # newest single-rollout prediction dir under $1 (empty if none)
 }
 
 USER_PHASES=${PHASES:-}
-if [ -z "${PHASES:-}" ] && [ "$VARIANT" = vanilla ]; then
+if [ -z "${PHASES:-}" ] && [[ $VARIANT == vanilla* ]]; then
   PHASES=vprep,vinfer,vaf3d,vaf3dplus
+  [ -z "${PREVIEW:-}" ] || PHASES=vprep,vdebug  # only the path and its 3DGUT renders, no ArtiFixer
+  [ "$TRAJ_MODE" != object ] || PHASES=vobject,$PHASES
 elif [ -z "${PHASES:-}" ] && [ "$VARIANT" = i360 ]; then
   PHASES=flashsplat,views,i360remove,i360virtual,i360nbs,i360lama,i360init,i360finetune
 elif [ -z "${PHASES:-}" ] && [ "$VARIANT" = af360 ]; then
@@ -177,7 +224,7 @@ fi
 
 missing=()
 needed=("$PY" "$CKPT" "$CHECKPOINT_PT" "$MODEL_ID" "$COLMAP")
-[ "$VARIANT" = vanilla ] || needed+=("${MASK_DIR:-<MASK_DIR: no masks_npy under $SAM_MASKS/$S>}")
+[[ $VARIANT == vanilla* ]] || needed+=("${MASK_DIR:-<MASK_DIR: no masks_npy under $SAM_MASKS/$S>}")
 case $VARIANT in
   i360)           needed+=("$LAMA") ;;
   i360sam)        needed+=("$LAMA" "$AF_PY") ;;
@@ -261,6 +308,9 @@ phase_flashsplat() {
   local labels=$FS_SRC
   if [ -f "$FS_SRC/hit_count.pt" ]; then
     echo "reusing labels, contribution and hit count from $FS_SRC"
+  elif [ -z "${FORCE:-}" ] && [ -f "$FS/hit_count.pt" ]; then
+    echo "reusing labels, contribution and hit count from $FS"
+    labels=$FS
   else
     echo "no hit_count.pt in $FS_SRC: segmenting again with masks $MASK_DIR"
     "$PY" -m data_processing.run_flashsplat_segmentation --checkpoint "$CKPT" --colmap_dir "$COLMAP" \
@@ -336,18 +386,79 @@ phase_af3dplus() {
       --neighbor_selection_mode covisibility --num_views "$NUM_VIEWS" "${MEM_ARGS[@]}" --replace_if_exists
 }
 
+object_labels() {  # the FlashSplat extraction of this scene's object that already exists (empty if none)
+  # FS_SRC first, then any other extraction next to the scene, then this pipeline's own; among them
+  # one with hit_count.pt (the removal's exact visibility filter) wins over labels.pt alone.
+  local d best=""
+  for d in "$FS_SRC" "$SR"/flashsplat_out* "$FS"; do
+    [ -f "$d/labels.pt" ] || continue
+    if [ -f "$d/hit_count.pt" ]; then echo "$d"; return; fi
+    [ -n "$best" ] || best=$d
+  done
+  echo "$best"
+}
+
+phase_vobject() {
+  # The object the vanilla path is built around: an existing FlashSplat extraction of it, else a new
+  # segmentation (labels only, no renders).
+  local found
+  found=$(object_labels)
+  if [ -n "$found" ]; then
+    echo "object from the existing FlashSplat extraction $found"
+    return
+  fi
+  [ -n "${MASK_DIR:-}" ] || { echo "no FlashSplat labels and no MASK_DIR (masks_npy under $SAM_MASKS/$S): set MASK_DIR, or TRAJ_MODE=vidsplat|travel"; return 1; }
+  "$PY" -m data_processing.run_flashsplat_segmentation --checkpoint "$CKPT" --colmap_dir "$COLMAP" \
+      --mask_dir "$MASK_DIR" --num_objects 1 --output_root "$FS" --outputs labels --save-hit-count \
+      --test_split_interval -1 --config_override selected_indices_file=null
+}
+
 phase_vprep() {
   # Prepared root $V with the photos as anchors and the novel path as targets, rendered from the
   # existing 3DGUT checkpoint (no reconstruction). Caption and metric scale come from the scene.
+  local scale
+  scale=$(sed -n 's/^Scale factor: *\([^ ]*\).*/\1/p' "$SR/metric_alignment/scale_info.txt" 2>/dev/null | head -1)
+  local traj=(--checkpoint "$CKPT" --clearance_m "$TRAJ_CLEARANCE_M" --d0_m "$TRAJ_D0_M" ${scale:+--metric_scale "$scale"}
+              ${TRAJ_MAX_FRAMES:+--max_frames "$TRAJ_MAX_FRAMES"})
+  case $TRAJ_MODE in
+    object)
+      local labels
+      labels=$(object_labels)
+      [ -n "$labels" ] || { echo "no FlashSplat labels for $S (vobject should have made them)"; return 1; }
+      traj+=(--mode object --flashsplat_dir "$labels" --orbit "$TRAJ_ORBIT" --radial "$TRAJ_RADIAL" --rise "$TRAJ_RISE")
+      [ "$TRAJ_RENDER_CHECK" = 0 ] || traj+=(--render_check --colmap_dir "$COLMAP")
+      [ "$TRAJ_ALLOW_FALLBACK" = 0 ] || traj+=(--allow_fallback) ;;
+    vidsplat)
+      traj+=(--mode vidsplat --colmap_dir "$COLMAP" --clip_len "$TRAJ_CLIP" --orbit_deg "$TRAJ_ORBIT_DEG"
+             --s_low "$TRAJ_S_LOW" --s_high "$TRAJ_S_HIGH" ${TRAJ_BUDGET:+--budget "$TRAJ_BUDGET"}) ;;
+    travel)
+      traj+=(--mode travel --side "$TRAJ_SIDE" --up "$TRAJ_UP") ;;
+  esac
+  # The path is redone when its settings change: a stale split.json would silently keep the old one.
+  local settings
+  settings=$(printf '%s\n' "${traj[@]}")
   if [ -z "${FORCE:-}" ] && [ -f "$V/split.json" ]; then
-    echo "found $V/split.json"
-    return
+    if [ "$(cat "$O/trajectory_input.args" 2>/dev/null)" = "$settings" ]; then
+      echo "found $V/split.json (same trajectory settings)"
+      return
+    fi
+    local old
+    old=$O/previous/$(date +%Y%m%d_%H%M%S)
+    mkdir -p "$old"
+    echo "trajectory settings changed: new path; the previous path and ArtiFixer outputs move to $old"
+    for f in "$O/artifixer" "$O/af3d_plus" "$O"/trajectory_input*; do
+      [ ! -e "$f" ] || mv "$f" "$old/"
+    done
   fi
   local prep=("$PY" -m data_processing.prepare_colmap_artifixer_inputs --colmap_dir "$COLMAP" --output_root "$V"
               --reconstruction_checkpoint "$CKPT" --reconstruction_steps 30000 ${FORCE:+--replace})
   "${prep[@]}" --phases prepare
+
+  echo "metric scale: ${scale:-<none in $SR/metric_alignment: estimating with MoGe; clearance from the object size>}"
+  echo "trajectory: $TRAJ_MODE"
   "$PY" scripts/bakerh/make_trajectory.py --transforms "$V/3dgrut_input/$S/nerfstudio/transforms.json" \
-      --output "$O/trajectory_input.json" --side "$TRAJ_SIDE" --up "$TRAJ_UP"
+      --output "$O/trajectory_input.json" "${traj[@]}" \
+    || { echo "make_trajectory.py found no acceptable $TRAJ_MODE path: see $O/trajectory_input_info.json and $O/trajectory_input.png"; return 1; }
 
   local caption=$V/captions/$S/caption.h5 src=""
   if [ -f "$SR/split.json" ]; then
@@ -365,23 +476,33 @@ print((root / entry["prompt_path"]).resolve())' "$SR")
     "$PY" output/jobs/write_caption.py --caption "$SCENE_CAPTION" --output_path "$caption" --text_encoder_model_id "$MODEL_ID"
   fi
 
-  local scale
-  scale=$(sed -n 's/^Scale factor: *\([^ ]*\).*/\1/p' "$SR/metric_alignment/scale_info.txt" 2>/dev/null | head -1)
-  echo "metric scale: ${scale:-<none in $SR/metric_alignment: estimating with MoGe>}"
   "${prep[@]}" --phases render,scale --trajectory_path "$O/trajectory_input.json" ${scale:+--metric_scale "$scale"}
   [ -f "$V/split.json" ] || { echo "prepare wrote no $V/split.json (trajectory renders incomplete?)"; return 1; }
+  echo "$settings" > "$O/trajectory_input.args"
+}
+
+debug_videos() {  # best effort: $O/debug/0_debug.mp4 (path top view | render | ArtiFixer | ArtiFixer3D+)
+  "$PY" scripts/bakerh/debug_video.py --variant_dir "$O" --scene "$S" \
+    || echo "WARNING: debug video failed; the run goes on"
+}
+
+phase_vdebug() {
+  debug_videos
 }
 
 phase_vinfer() {
   # ArtiFixer on the path renders, photos as reference views (upstream default neighbour selection).
   if [ -z "${FORCE:-}" ] && [ -n "$(pred_dir "$O/artifixer")" ]; then
     echo "found $(pred_dir "$O/artifixer")"
+    debug_videos
     return
   fi
   "$PY" -m model_eval.run_inference --evalset reconstructed_colmap \
       --checkpoint_pt "$CHECKPOINT_PT" --model_id "$MODEL_ID" \
       --save_dir "$O/artifixer" --split_path "$V/split.json" --render_trajectory trajectory \
       --num_views "$NUM_VIEWS" "${MEM_ARGS[@]}" --replace_if_exists
+  touch "$O/af3d_stale"  # new ArtiFixer frames: vaf3d must distill again, not reuse its checkpoint
+  debug_videos
 }
 
 phase_vaf3d() {
@@ -389,15 +510,26 @@ phase_vaf3d() {
   pred=$(pred_dir "$O/artifixer")
   [ -n "$pred" ] || { echo "no ArtiFixer output under $O/artifixer: run vinfer first"; return 1; }
   echo "ArtiFixer frames: $pred"
+  local replace=()
+  if [ -n "${FORCE:-}" ] || [ -e "$O/af3d_stale" ]; then replace=(--replace); fi
   "$PY" -m data_processing.run_artifixer3d --scene_root "$V" --artifixer_frames_dir "$pred" \
-      --artifixer3d_steps "$AF3D_STEPS"
+      --artifixer3d_steps "$AF3D_STEPS" ${replace[@]+"${replace[@]}"}
+  rm -f "$O/af3d_stale"
 }
 
 phase_vaf3dplus() {
+  local done_pred
+  done_pred=$(pred_dir "$O/af3d_plus")
+  if [ -z "${FORCE:-}" ] && [ -n "$done_pred" ] && [ "$done_pred" -nt "$(pred_dir "$O/artifixer")" ]; then
+    echo "found $done_pred (newer than the ArtiFixer frames it builds on)"
+    debug_videos
+    return
+  fi
   "$PY" -m model_eval.run_inference --evalset reconstructed_colmap \
       --checkpoint_pt "$CHECKPOINT_PT" --model_id "$MODEL_ID" \
       --save_dir "$O/af3d_plus" --split_path "$V/split_artifixer3d_plus.json" --render_trajectory trajectory \
       --num_views "$NUM_VIEWS" "${MEM_ARGS[@]}" --replace_if_exists
+  debug_videos
 }
 
 phase_views() {
@@ -513,7 +645,7 @@ phase_affinetune() {
 {
   echo "scene=$S variant=$VARIANT phases=$PHASES seeds=${SEEDS:-} gpu=$GPU"
   echo "scene_root=$SR"; echo "flashsplat_src=$FS_SRC"; echo "flashsplat_out=$FS"; echo "masks=${MASK_DIR:-}"
-  echo "vanilla path: side=$TRAJ_SIDE up=$TRAJ_UP spacings (used by vprep only)"
+  echo "vanilla path: mode=$TRAJ_MODE clearance=${TRAJ_CLEARANCE_M} m d0=${TRAJ_D0_M} m; object: orbit=$TRAJ_ORBIT radial=$TRAJ_RADIAL rise=$TRAJ_RISE radii render_check=$TRAJ_RENDER_CHECK allow_fallback=$TRAJ_ALLOW_FALLBACK; vidsplat: clip=$TRAJ_CLIP orbit_deg=$TRAJ_ORBIT_DEG s_low=$TRAJ_S_LOW s_high=$TRAJ_S_HIGH budget=${TRAJ_BUDGET:-photos}; travel: side=$TRAJ_SIDE up=$TRAJ_UP spacings"
   echo "baselines: flashsplat=$FSP views=$PCOLMAP (frames ${FRAMES:-all}) models=$MODELS af360_repo=$AF360_REPO af_py=$AF_PY"
   echo "frames=${FRAMES:-all} hole=$HOLE_SHAPE+${DILATE}px refs=render outside=$OUTSIDE num_views=$NUM_VIEWS"
   echo "scene_caption=$SCENE_CAPTION"; echo "empty_caption=$EMPTY_CAPTION"
@@ -549,8 +681,18 @@ if [[ ",$PHASES," == *,af3dplus,* ]]; then
   echo "ArtiFixer3D+ output:"
   find "$O/af3d_plus" -name '*.mp4' | head -5
 fi
+if [[ ",$PHASES," == *,vdebug,* ]]; then
+  echo
+  echo "Path preview ($TRAJ_MODE):"
+  echo "  top view:     $O/trajectory_input.png   details: $O/trajectory_input_info.json"
+  echo "  3DGUT renders: $V/recon_results/$S/reconstruction/$S/ours_30000/trajectory/renders"
+  echo "  video:        $O/debug/0_debug.mp4 (top view with the current camera | render)"
+  echo "The full run reuses this path and its renders while the TRAJ_* settings stay the same."
+fi
 if [[ ",$PHASES," == *,vaf3dplus,* ]]; then
   echo
+  echo "Path top view:        $O/trajectory_input.png"
+  echo "Debug video:          $O/debug/0_debug.mp4 (top view | render | ArtiFixer | ArtiFixer3D+)"
   echo "3DGUT path renders:   $V/recon_results/$S/reconstruction/$S/ours_30000/trajectory/renders"
   echo "ArtiFixer output:"; find "$O/artifixer" -name '*.mp4' | head -5
   echo "ArtiFixer3D renders:  $(find "$V/artifixer3d" -type d -name renders 2>/dev/null | head -1)"
