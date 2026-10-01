@@ -37,8 +37,9 @@ export JOBS=${JOBS# }
 # Preflight (read-only): what each scene has, so a missing input shows now, not hours into the run.
 SAM_MASKS=${SAM_MASKS:-/workspace/amazzucchelli/fbk-3dworld/FlashSplat/sam3_single_object_anchor_tracking}
 echo "jobs: $JOBS"
-for s in $(printf '%s\n' $JOBS | cut -d: -f1 | uniq); do
+for s in $(printf '%s\n' $JOBS | cut -d: -f1 | awk '!seen[$0]++'); do
   sr=${SCENE_ROOT:-$AF/output/bakerh_undis/$s}
+  [ "$s" != G35 ] || sr=${G35_ROOT:-$sr}
   ckpt=$sr/3dgrut_runs/$s/$s/ours_30000/ckpt_30000.pt
   photos=$(find "$sr/3dgrut_input/$s/images" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')
   labels=""

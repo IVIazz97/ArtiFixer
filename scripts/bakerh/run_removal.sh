@@ -3,7 +3,7 @@
 #
 # Usage, from the repo root:
 #   bash scripts/bakerh/run_removal.sh SCENE VARIANT
-#     SCENE    TA_BLUE_MOTOR | PCV | Compressor
+#     SCENE    TA_BLUE_MOTOR | PCV | TA_TURBINE | G35 | Compressor
 #     VARIANT  normal   hole = SAM mask + projected object, dilated 12 px; scene caption
 #              bighull  hole = 2D convex hull of that, dilated 80 px; "empty floor" caption
 #   Both variants give ArtiFixer the object-free background renders as reference views, never the
@@ -49,10 +49,15 @@
 #                     travel and TRAJ_UP (0.5) up, keeping the photo rotations.
 # PREVIEW=1 stops after the path and its 3DGUT renders (phases [vobject,] vprep, vdebug: top view +
 # debug/0_debug.mp4), to check a path before ArtiFixer runs (preview_trajectories.sh does all nine).
-# VARIANT loop_object / loop_vidsplat / loop_travel runs up to LOOP_ROUNDS (5) rounds of that path type,
-# each on the previous round's model (round 1: the 3DGUT reconstruction), distilling photos + every fixed
-# frame so far (see "Loop" further down; run_loop.sh runs loop_vidsplat on TA_BLUE_MOTOR, PCV and
-# TA_TURBINE). LOOP_STEPS (5000) extra steps per round, LOOP_LR, LOOP_DISTILL=continue|scratch.
+# VARIANT loop_<mode> / once_<mode> / scratch_<mode> (mode object|vidsplat|travel) runs up to LOOP_ROUNDS
+# (5) rounds of that path type, each adding a new path's ArtiFixer frames to the dataset (see "Loop"
+# further down; run_loop_all.sh runs all three on TA_BLUE_MOTOR, PCV, TA_TURBINE and G35):
+#   loop_     each round continues the previous model (round 1: the 3DGUT reconstruction) for LOOP_STEPS
+#             (5000) steps on photos + every fixed frame so far ("+5K"; LOOP_LR)
+#   once_     no training between rounds (every path is chosen and rendered with the reconstruction),
+#             then ArtiFixer3D once, from scratch for AF3D_STEPS (30000), on photos + all fixed frames
+#   scratch_  each round trains ArtiFixer3D from scratch for AF3D_STEPS on photos + every fixed frame
+#             so far, and the next round's path is chosen on that model (5 x 30000 = "+150K")
 # VARIANT vanilla_object / vanilla_vidsplat / vanilla_travel sets TRAJ_MODE and writes to its own
 # directory (run_trajectories.sh runs all three on TA_BLUE_MOTOR, PCV and TA_TURBINE). TRAJ_MAX_FRAMES
 # caps the path length (object/travel: every k-th frame) for scenes with many photos.
@@ -80,8 +85,8 @@
 # Outputs: output/bakerh_removal/<scene>/<variant>/. Logs: .../logs/<timestamp>/NN_<phase>.log and
 # .../logs/summary.log (start, end, duration and peak GPU memory of every phase, across runs).
 set -euo pipefail
-SCENE=${1:?usage: run_removal.sh SCENE VARIANT   (SCENE: TA_BLUE_MOTOR|PCV|TA_TURBINE|Compressor, VARIANT: normal|bighull|vanilla[_object|_vidsplat|_travel]|i360|af360|i360sam|af360sam)}
-VARIANT=${2:?usage: run_removal.sh SCENE VARIANT   (VARIANT: normal|bighull|vanilla[_object|_vidsplat|_travel]|i360|af360|i360sam|af360sam)}
+SCENE=${1:?usage: run_removal.sh SCENE VARIANT   (SCENE: TA_BLUE_MOTOR|PCV|TA_TURBINE|G35|Compressor, VARIANT: normal|bighull|vanilla[_object|_vidsplat|_travel]|loop_<mode>|once_<mode>|scratch_<mode>|i360|af360|i360sam|af360sam)}
+VARIANT=${2:?usage: run_removal.sh SCENE VARIANT   (VARIANT: normal|bighull|vanilla[_object|_vidsplat|_travel]|loop_<mode>|once_<mode>|scratch_<mode>|i360|af360|i360sam|af360sam)}
 AF=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$AF"
 
@@ -127,26 +132,30 @@ case $S in
   TA_TURBINE)
     SR=${SCENE_ROOT:-$AF/output/bakerh_undis/$S}; FS_SRC=${FS_SRC:-$SR/flashsplat_out}; FRAMES=${FRAMES-}
     SCENE_CAPTION=${SCENE_CAPTION:-"An industrial hall with a large turbine standing on the floor, surrounded by pipes and equipment."} ;;
+  G35)
+    SR=${G35_ROOT:-${SCENE_ROOT:-$AF/output/bakerh_undis/$S}}; FS_SRC=${FS_SRC:-$SR/flashsplat_out}; FRAMES=${FRAMES-}
+    SCENE_CAPTION=${SCENE_CAPTION:-"An industrial hall with large machinery standing on the floor, surrounded by pipes and equipment."} ;;
   Compressor)
     # The ds2 scene already has split.json, caption, metric scale and the tuned FlashSplat labels.
     # Only frames 49-148 and 284-304 go through ArtiFixer: all 923 at once ran out of memory.
     SR=${SCENE_ROOT:-$AF/output/bakerh_undis_ds2_from1600/$S}
     FS_SRC=${FS_SRC:-$SR/flashsplat_out_per_view_norm_gt0p1_hull_trim995}; FRAMES=${FRAMES-${COMPRESSOR_FRAMES-49-148,284-304}}
     SCENE_CAPTION=${SCENE_CAPTION:-} ;;
-  *) echo "unknown SCENE '$S' (TA_BLUE_MOTOR, PCV, TA_TURBINE, Compressor)" >&2; exit 2 ;;
+  *) echo "unknown SCENE '$S' (TA_BLUE_MOTOR, PCV, TA_TURBINE, G35, Compressor)" >&2; exit 2 ;;
 esac
 case $VARIANT in
   normal)  HOLE_SHAPE=${HOLE_SHAPE:-mask}; DILATE=${DILATE:-12} ;;
   bighull) HOLE_SHAPE=${HOLE_SHAPE:-hull}; DILATE=${DILATE:-80} ;;
-  loop_object|loop_vidsplat|loop_travel) HOLE_SHAPE=none; DILATE=0; TRAJ_MODE=${VARIANT#loop_}
-    [ "$S" != Compressor ] || { echo "the loop is for TA_BLUE_MOTOR, PCV and TA_TURBINE only" >&2; exit 2; } ;;
+  loop_object|loop_vidsplat|loop_travel|once_object|once_vidsplat|once_travel|scratch_object|scratch_vidsplat|scratch_travel)
+    HOLE_SHAPE=none; DILATE=0; TRAJ_MODE=${VARIANT#*_}; LOOP_TRAIN=${VARIANT%%_*}
+    [ "$S" != Compressor ] || { echo "the loop is for TA_BLUE_MOTOR, PCV, TA_TURBINE and G35 only" >&2; exit 2; } ;;
   vanilla|vanilla_object|vanilla_vidsplat|vanilla_travel) HOLE_SHAPE=none; DILATE=0
     # vanilla_<mode> fixes TRAJ_MODE and has its own output dir, so the three paths can sit side by side.
     [ "$VARIANT" = vanilla ] || TRAJ_MODE=${VARIANT#vanilla_}
     # One path frame per photo: all 923 Compressor photos would not fit through ArtiFixer.
     [ "$S" != Compressor ] || { echo "vanilla is for TA_BLUE_MOTOR, PCV and TA_TURBINE only" >&2; exit 2; } ;;
   i360|af360|i360sam|af360sam) HOLE_SHAPE=none; DILATE=0; export HF_HUB_OFFLINE=1 ;;
-  *) echo "unknown VARIANT '$VARIANT' (normal, bighull, vanilla, vanilla_object, vanilla_vidsplat, vanilla_travel, loop_object, loop_vidsplat, loop_travel, i360, af360, i360sam, af360sam)" >&2; exit 2 ;;
+  *) echo "unknown VARIANT '$VARIANT' (normal, bighull, vanilla, vanilla_object, vanilla_vidsplat, vanilla_travel, {loop,once,scratch}_{object,vidsplat,travel}, i360, af360, i360sam, af360sam)" >&2; exit 2 ;;
 esac
 TRAJ_MODE=${TRAJ_MODE:-object}
 case $TRAJ_MODE in object|vidsplat|travel) ;; *) echo "unknown TRAJ_MODE '$TRAJ_MODE' (object, vidsplat, travel)" >&2; exit 2 ;; esac
@@ -169,7 +178,7 @@ TRAJ_MAX_FRAMES=${TRAJ_MAX_FRAMES:-}
 LOOP_ROUNDS=${LOOP_ROUNDS:-5}
 LOOP_STEPS=${LOOP_STEPS:-5000}
 LOOP_LR=${LOOP_LR:-1}
-LOOP_DISTILL=${LOOP_DISTILL:-continue}
+LOOP_TRAIN=${LOOP_TRAIN:-}  # loop|once|scratch: set by the variant
 # Baselines: local model folders (no Hugging Face on the VM) and the AuraFusion360 2D-model venv.
 MODELS=${MODELS:-/workspace/amazzucchelli/fbk-3dworld/models}
 LAMA=${LAMA:-$MODELS/LaMa/big-lama.pt}
@@ -202,8 +211,9 @@ if [ -z "${PHASES:-}" ] && [[ $VARIANT == vanilla* ]]; then
   PHASES=vprep,vinfer,vaf3d,vaf3dplus
   [ -z "${PREVIEW:-}" ] || PHASES=vprep,vdebug  # only the path and its 3DGUT renders, no ArtiFixer
   [ "$TRAJ_MODE" != object ] || PHASES=vobject,$PHASES
-elif [ -z "${PHASES:-}" ] && [[ $VARIANT == loop_* ]]; then
+elif [ -z "${PHASES:-}" ] && [ -n "$LOOP_TRAIN" ]; then
   PHASES=vloopplus
+  [ "$LOOP_TRAIN" != once ] || PHASES=vonce,$PHASES
   for ((k = LOOP_ROUNDS; k >= 1; k--)); do PHASES=vround$k,$PHASES; done
   [ "$TRAJ_MODE" != object ] || PHASES=vobject,$PHASES
 elif [ -z "${PHASES:-}" ] && [ "$VARIANT" = i360 ]; then
@@ -220,6 +230,26 @@ elif [ -z "${PHASES:-}" ]; then
     if [ -n "$(pred_dir "$O/artifixer")" ]; then PHASES=propagate,af3d,af3dplus
     else PHASES=$PHASES,propagate,af3d,af3dplus; fi
   fi
+fi
+
+# A loop folder made with other settings (or before they were recorded) would hand its finished
+# rounds to this run: it moves to <scene>/previous/ instead (FRESH=1 always moves it).
+if [ -n "$LOOP_TRAIN" ] && [ -z "$USER_PHASES" ]; then
+  loop_settings="v2 train=$LOOP_TRAIN rounds=$LOOP_ROUNDS steps=$LOOP_STEPS lr=$LOOP_LR af3d=$AF3D_STEPS views=$NUM_VIEWS \
+traj=$TRAJ_CLEARANCE_M,$TRAJ_D0_M,${TRAJ_MAX_FRAMES:-},$TRAJ_CLIP,$TRAJ_ORBIT_DEG,$TRAJ_S_LOW,$TRAJ_S_HIGH,${TRAJ_BUDGET:-},$TRAJ_SEEDS,\
+$TRAJ_ORBIT,$TRAJ_RADIAL,$TRAJ_RISE,$TRAJ_SIDE,$TRAJ_UP,$TRAJ_RENDER_CHECK,$TRAJ_ALLOW_FALLBACK"
+  if [ -d "$O" ] && [ ! -f "$O/loop.settings" ] && [ -z "${FRESH:-}" ] && [ "$LOOP_TRAIN" = loop ] \
+      && grep -q '"seed_indices"' "$O/round_1/new_path_info.json" 2>/dev/null; then
+    echo "$loop_settings" > "$O/loop.settings"  # a run of the same code from before loop.settings: resume it
+  fi
+  if [ -d "$O" ] && { [ -n "${FRESH:-}" ] || [ "$(cat "$O/loop.settings" 2>/dev/null)" != "$loop_settings" ]; }; then
+    old=$OUT_ROOT/$S/previous/${VARIANT}_$(date +%Y%m%d_%H%M%S)
+    mkdir -p "$OUT_ROOT/$S/previous"
+    mv "$O" "$old"
+    echo "$O was made with other settings$([ -z "${FRESH:-}" ] || echo ' (FRESH=1)'): moved to $old"
+  fi
+  mkdir -p "$O"
+  echo "$loop_settings" > "$O/loop.settings"
 fi
 
 STAMP=$(date +%Y%m%d_%H%M%S)
@@ -240,7 +270,7 @@ fi
 
 missing=()
 needed=("$PY" "$CKPT" "$CHECKPOINT_PT" "$MODEL_ID" "$COLMAP")
-[[ $VARIANT == vanilla* || $VARIANT == loop_* ]] || needed+=("${MASK_DIR:-<MASK_DIR: no masks_npy under $SAM_MASKS/$S>}")
+[[ $VARIANT == vanilla* || -n $LOOP_TRAIN ]] || needed+=("${MASK_DIR:-<MASK_DIR: no masks_npy under $SAM_MASKS/$S>}")
 case $VARIANT in
   i360)           needed+=("$LAMA") ;;
   i360sam)        needed+=("$LAMA" "$AF_PY") ;;
@@ -535,11 +565,15 @@ phase_vdebug() {
 # Round k: the path is chosen on the round k-1 model (round 0: the 3DGUT reconstruction; vidsplat counts
 # every earlier generated view as seen; object/travel shift their weave by (k-1)/LOOP_ROUNDS of a
 # period), all paths so far are rendered with that model, ArtiFixer fixes only the new frames, and
-# ArtiFixer3D continues that model on photos + every fixed frame so far for LOOP_STEPS more steps, with
-# the from-scratch densification windows and position LR decay squeezed into those steps (the LR
-# restarts at LOOP_LR x its initial value). LOOP_DISTILL=scratch instead retrains every round from
-# scratch for AF3D_STEPS. Each round gets 1/LOOP_ROUNDS of the frame budget. A later round that finds no
-# acceptable new path ends the loop.
+# then, by variant (LOOP_TRAIN):
+#   loop     ArtiFixer3D continues that model on photos + every fixed frame so far for LOOP_STEPS more
+#            steps, with the from-scratch densification windows and position LR decay squeezed into
+#            those steps (the LR restarts at LOOP_LR x its initial value)
+#   scratch  ArtiFixer3D retrains from scratch for AF3D_STEPS on photos + every fixed frame so far
+#   once     no training: the round's model is the reconstruction; vonce trains ArtiFixer3D from
+#            scratch for AF3D_STEPS once, on photos + every round's fixed frames
+# Each round gets 1/LOOP_ROUNDS of the frame budget. A later round that finds no acceptable new path
+# ends the loop.
 # vloopplus runs ArtiFixer3D+ over all paths with the last model. Outputs: $O/round_<k>/, $O/final.
 loop_round() {
   local k=$1 R=$O/round_$1 prev=$O/round_$(($1 - 1)) base steps first per_round n_photos offset pred i
@@ -623,8 +657,14 @@ PYEOF
     for i in "$prev"/pred_all/*.png; do ln -s "$(readlink -f "$i")" "$R/pred_all/$(basename "$i")"; done
   fi
   for i in "$pred"/*.png; do ln -sfn "$(readlink -f "$i")" "$R/pred_all/$(basename "$i")"; done
+  if [ "$LOOP_TRAIN" = once ]; then  # trained once, after the last round (vonce)
+    echo "$CKPT" > "$R/model.txt"
+    "$PY" scripts/bakerh/debug_video.py --variant_dir "$R" --scene "$S" \
+      || echo "WARNING: debug video failed; the run goes on"
+    return 0
+  fi
   local distill=()
-  if [ "$LOOP_DISTILL" = scratch ]; then
+  if [ "$LOOP_TRAIN" = scratch ]; then
     steps=$AF3D_STEPS
   else
     steps=$(( $("$PY" -c 'import sys, torch; print(int(torch.load(sys.argv[1], map_location="cpu", weights_only=False)["global_step"]))' "$base") + LOOP_STEPS ))
@@ -642,12 +682,36 @@ PYEOF
     || echo "WARNING: debug video failed; the run goes on"
 }
 
+last_round() {  # the last finished loop round's folder (empty if none)
+  local k
+  for k in $(seq "$LOOP_ROUNDS" -1 1); do
+    if [ -f "$O/round_$k/model.txt" ]; then echo "$O/round_$k"; return; fi
+  done
+}
+
+phase_vonce() {
+  # once_<mode>: ArtiFixer3D from scratch, once, on photos + every round's fixed frames.
+  local R C model
+  R=$(last_round)
+  [ -n "$R" ] || { echo "no finished loop round under $O"; return 1; }
+  C=$R/$S
+  model=$( { find "$R/artifixer3d" -name "ckpt_${AF3D_STEPS}.pt" 2>/dev/null || true; } | head -1)
+  if [ -z "${FORCE:-}" ] && [ -n "$model" ] && [ "$(cat "$R/model.txt")" = "$model" ]; then
+    echo "found $model"
+    return 0
+  fi
+  echo "ArtiFixer3D once: photos + $(ls "$R/pred_all" | wc -l) fixed frames of $(basename "$R") rounds, from scratch, $AF3D_STEPS steps"
+  "$PY" -m data_processing.run_artifixer3d --scene_root "$C" --artifixer_frames_dir "$R/pred_all" \
+      --output_root "$R/artifixer3d" --artifixer3d_steps "$AF3D_STEPS" --phases distill ${FORCE:+--replace}
+  model=$(find "$R/artifixer3d" -name "ckpt_${AF3D_STEPS}.pt" | head -1)
+  [ -n "$model" ] || { echo "ArtiFixer3D wrote no ckpt_${AF3D_STEPS}.pt under $R/artifixer3d"; return 1; }
+  echo "$model" > "$R/model.txt"
+}
+
 phase_vloopplus() {
   # ArtiFixer3D+ over every path of the loop, rendered with the last round's model.
-  local k R="" C model steps done_pred
-  for k in $(seq "$LOOP_ROUNDS" -1 1); do
-    if [ -f "$O/round_$k/model.txt" ]; then R=$O/round_$k; break; fi
-  done
+  local R C model steps done_pred
+  R=$(last_round)
   [ -n "$R" ] || { echo "no finished loop round under $O"; return 1; }
   C=$R/$S
   model=$(cat "$R/model.txt")

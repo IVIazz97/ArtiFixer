@@ -112,6 +112,7 @@ for p in "$PY" "$AF/checkpoints/ArtiFixer/artifixer-1.3b.pt" "$AF/checkpoints/Wa
          "$AF/output/bakerh_undis/TA_BLUE_MOTOR/3dgrut_runs/TA_BLUE_MOTOR/TA_BLUE_MOTOR/ours_30000/ckpt_30000.pt" \
          "$AF/output/bakerh_undis/PCV/3dgrut_runs/PCV/PCV/ours_30000/ckpt_30000.pt" \
          "$AF/output/bakerh_undis/TA_TURBINE/3dgrut_runs/TA_TURBINE/TA_TURBINE/ours_30000/ckpt_30000.pt" \
+         "${G35_ROOT:-$AF/output/bakerh_undis/G35}/3dgrut_runs/G35/G35/ours_30000/ckpt_30000.pt" \
          "$AF/output/bakerh_undis_ds2_from1600/Compressor/3dgrut_runs/Compressor/Compressor/ours_30000/ckpt_30000.pt" \
          "$AF/output/bakerh_undis_ds2_from1600/Compressor/split.json" \
          "$AF/output/bakerh_undis_ds2_from1600/Compressor/flashsplat_out_per_view_norm_gt0p1_hull_trim995/hit_count.pt"; do
@@ -139,6 +140,24 @@ for job in $JOBS; do
   job_logs=$OUT_ROOT/$scene/$variant/logs/latest
   section "job $job: $status ($((took / 60)) min)"
   cat "$job_logs/summary.log" >> "$REPORT" 2>/dev/null
+  if [ -d "$OUT_ROOT/$scene/$variant/round_1" ]; then  # loop jobs: what every round chose and trained
+    "$PY" - "$OUT_ROOT/$scene/$variant" >> "$REPORT" 2>&1 <<'PYEOF'
+import json, sys
+from pathlib import Path
+o = Path(sys.argv[1])
+print("rounds:", (o / "loop.settings").read_text().strip() if (o / "loop.settings").exists() else "(no loop.settings)")
+for r in sorted(o.glob("round_*"), key=lambda p: int(p.name.split("_")[1])):
+    info = json.loads((r / "new_path_info.json").read_text()) if (r / "new_path_info.json").exists() else {}
+    rej = ", ".join(f"{k} {v}" for k, v in (info.get("rejected") or {}).items() if v)
+    model = (r / "model.txt").read_text().strip() if (r / "model.txt").exists() else "none"
+    print(f"  {r.name}: clips {len(info.get('clips', []))}/{info.get('clips_wanted', '?')} from {info.get('seeds_tried', '?')} seeds "
+          f"(valid {info.get('valid_seeds', '?')}), rejected: {rej or '-'}; fixed frames so far "
+          f"{len(list((r / 'pred_all').glob('*.png')))}; model {model.replace(str(o) + '/', '')}"
+          + (f"; FAILED: {info['failed']}" if info.get("failed") else ""))
+if (o / "loop_ended").exists():
+    print(f"  loop ended at round {(o / 'loop_ended').read_text().strip()}: no acceptable new path")
+PYEOF
+  fi
   if [ "$code" -ne 0 ] && [ -f "$job_logs/FAILED" ]; then
     failed_log=$(sed -n 's/.*log=//p' "$job_logs/FAILED")
     echo "--- last 80 lines of $failed_log" >> "$REPORT"
