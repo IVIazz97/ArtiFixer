@@ -48,10 +48,10 @@
 #                     travel and TRAJ_UP (0.5) up, keeping the photo rotations.
 # PREVIEW=1 stops after the path and its 3DGUT renders (phases [vobject,] vprep, vdebug: top view +
 # debug/0_debug.mp4), to check a path before ArtiFixer runs (preview_trajectories.sh does all nine).
-# VARIANT loop_object / loop_vidsplat / loop_travel runs LOOP_ROUNDS (3) rounds of that path type, each
-# on the previous round's model, distilling photos + every fixed frame so far (see "Loop" further down;
-# run_loop.sh runs loop_vidsplat on TA_BLUE_MOTOR, PCV and TA_TURBINE). LOOP_STEPS (10000) extra steps
-# per round, LOOP_DISTILL=continue|scratch.
+# VARIANT loop_object / loop_vidsplat / loop_travel runs up to LOOP_ROUNDS (5) rounds of that path type,
+# each on the previous round's model (round 1: the 3DGUT reconstruction), distilling photos + every fixed
+# frame so far (see "Loop" further down; run_loop.sh runs loop_vidsplat on TA_BLUE_MOTOR, PCV and
+# TA_TURBINE). LOOP_STEPS (5000) extra steps per round, LOOP_LR, LOOP_DISTILL=continue|scratch.
 # VARIANT vanilla_object / vanilla_vidsplat / vanilla_travel sets TRAJ_MODE and writes to its own
 # directory (run_trajectories.sh runs all three on TA_BLUE_MOTOR, PCV and TA_TURBINE). TRAJ_MAX_FRAMES
 # caps the path length (object/travel: every k-th frame) for scenes with many photos.
@@ -164,8 +164,9 @@ TRAJ_S_LOW=${TRAJ_S_LOW:-0.03}
 TRAJ_S_HIGH=${TRAJ_S_HIGH:-0.4}
 TRAJ_BUDGET=${TRAJ_BUDGET:-}
 TRAJ_MAX_FRAMES=${TRAJ_MAX_FRAMES:-}
-LOOP_ROUNDS=${LOOP_ROUNDS:-3}
-LOOP_STEPS=${LOOP_STEPS:-10000}
+LOOP_ROUNDS=${LOOP_ROUNDS:-5}
+LOOP_STEPS=${LOOP_STEPS:-5000}
+LOOP_LR=${LOOP_LR:-1}
 LOOP_DISTILL=${LOOP_DISTILL:-continue}
 # Baselines: local model folders (no Hugging Face on the VM) and the AuraFusion360 2D-model venv.
 MODELS=${MODELS:-/workspace/amazzucchelli/fbk-3dworld/models}
@@ -528,13 +529,15 @@ phase_vdebug() {
   debug_videos
 }
 
-# Loop (loop_<mode>): LOOP_ROUNDS rounds, each adding a new path of TRAJ_MODE to the reconstruction.
-# Round k: the path is chosen on the round k-1 model (vidsplat counts every earlier generated view as
-# seen; object/travel shift their weave by (k-1)/LOOP_ROUNDS of a period), all paths so far are
-# rendered with that model, ArtiFixer fixes only the new frames, and ArtiFixer3D distills photos +
-# every fixed frame so far into the round k model (round 1 from scratch, later rounds continue the
-# previous model for LOOP_STEPS more steps; LOOP_DISTILL=scratch retrains each round). Each round gets
-# 1/LOOP_ROUNDS of the frame budget. A later round that finds no acceptable new path ends the loop.
+# Loop (loop_<mode>): up to LOOP_ROUNDS rounds, each adding a new path of TRAJ_MODE to the reconstruction.
+# Round k: the path is chosen on the round k-1 model (round 0: the 3DGUT reconstruction; vidsplat counts
+# every earlier generated view as seen; object/travel shift their weave by (k-1)/LOOP_ROUNDS of a
+# period), all paths so far are rendered with that model, ArtiFixer fixes only the new frames, and
+# ArtiFixer3D continues that model on photos + every fixed frame so far for LOOP_STEPS more steps, with
+# the from-scratch densification windows and position LR decay squeezed into those steps (the LR
+# restarts at LOOP_LR x its initial value). LOOP_DISTILL=scratch instead retrains every round from
+# scratch for AF3D_STEPS. Each round gets 1/LOOP_ROUNDS of the frame budget. A later round that finds no
+# acceptable new path ends the loop.
 # vloopplus runs ArtiFixer3D+ over all paths with the last model. Outputs: $O/round_<k>/, $O/final.
 loop_round() {
   local k=$1 R=$O/round_$1 prev=$O/round_$(($1 - 1)) base steps first per_round n_photos offset pred i
@@ -619,11 +622,11 @@ PYEOF
   fi
   for i in "$pred"/*.png; do ln -sfn "$(readlink -f "$i")" "$R/pred_all/$(basename "$i")"; done
   local distill=()
-  if [ "$k" -eq 1 ] || [ "$LOOP_DISTILL" = scratch ]; then
+  if [ "$LOOP_DISTILL" = scratch ]; then
     steps=$AF3D_STEPS
   else
     steps=$(( $("$PY" -c 'import sys, torch; print(int(torch.load(sys.argv[1], map_location="cpu", weights_only=False)["global_step"]))' "$base") + LOOP_STEPS ))
-    distill=(--base_checkpoint "$base")
+    distill=(--base_checkpoint "$base" --rescale_schedule --lr_scale "$LOOP_LR")
   fi
   echo "ArtiFixer3D: photos + $(ls "$R/pred_all" | wc -l) fixed frames, $([ ${#distill[@]} -gt 0 ] && echo "continuing $base to step $steps" || echo "from scratch, $steps steps")"
   "$PY" -m data_processing.run_artifixer3d --scene_root "$C" --artifixer_frames_dir "$R/pred_all" \

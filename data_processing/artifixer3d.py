@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import shutil
 import struct
 from dataclasses import dataclass
@@ -535,6 +536,39 @@ def materialize_distillation_input(
     write_json(paths.distillation_selected_indices_path, scene.selected_indices)
 
 
+def continuation_schedule_overrides(
+    strategy: dict, scheduler: dict, n_iterations: int, start: int, end: int, lr_scale: float = 1.0
+) -> list[str]:
+    """Hydra overrides that replay the config's from-scratch schedule inside [start, end] when training
+    continues a checkpoint at global step start: every strategy window (MCMC relocate/add/perturb, GS
+    densify/prune) and every exponential LR decay is rescaled from n_iterations to end - start steps.
+    Without them a checkpoint past the windows (step 30000 > relocate/add end 25000) would gain no
+    Gaussians where the new frames show new surface, and positions would stay at the final LR.
+    The exponential decay restarts at lr_scale x its initial LR. 3DGRUT's scheduler takes the absolute
+    step (t = step / max_steps), so lr_init is set to where that log-linear line would start at step 0."""
+    window = end - start
+    assert window > 0 and n_iterations > 0, f"empty continuation window {start}..{end}"
+
+    def at(step: int) -> int:
+        return step if step < 0 else start + round(step * window / n_iterations)
+
+    overrides = []
+    for name, entry in strategy.items():
+        if isinstance(entry, dict) and "start_iteration" in entry and "end_iteration" in entry:
+            overrides += [
+                f"strategy.{name}.start_iteration={at(int(entry['start_iteration']))}",
+                f"strategy.{name}.end_iteration={at(int(entry['end_iteration']))}",
+            ]
+    for name, entry in scheduler.items():
+        if isinstance(entry, dict) and entry.get("type") == "exp":
+            stop = at(int(entry["max_steps"]))
+            t0 = start / stop
+            lr0 = max(lr_scale * float(entry["lr_init"]), float(entry["lr_final"]))
+            lr_init = math.exp((math.log(lr0) - t0 * math.log(float(entry["lr_final"]))) / (1 - t0))
+            overrides += [f"scheduler.{name}.lr_init={lr_init!r}", f"scheduler.{name}.max_steps={stop}"]
+    return overrides
+
+
 def train_artifixer3d(
     scene: PreparedScene,
     paths: Artifixer3DPaths,
@@ -545,6 +579,8 @@ def train_artifixer3d(
     steps: int,
     use_wandb: bool,
     replace: bool,
+    rescale_schedule: bool = False,
+    lr_scale: float = 1.0,
 ) -> tuple[Path, bool]:
     """Run or reuse the 3DGRUT distillation checkpoint for the prepared scene."""
     checkpoint = artifixer3d_checkpoint(scene, paths, steps)
@@ -571,6 +607,24 @@ def train_artifixer3d(
         base_checkpoint = base_checkpoint.resolve()
         assert base_checkpoint.is_file(), f"Missing initial 3DGRUT checkpoint: {base_checkpoint}"
         overrides.append(f"resume={base_checkpoint}")
+        if rescale_schedule:
+            import torch
+            from omegaconf import OmegaConf
+
+            start = int(torch.load(base_checkpoint, map_location="cpu", weights_only=False)["global_step"])
+            defaults = threedgrut_training.compose_3dgrut_config(
+                config_name, [], threedgrut_training.DEFAULT_THREEDGRUT_CONFIG_DIR
+            )
+            schedule = continuation_schedule_overrides(
+                OmegaConf.to_container(defaults.strategy, resolve=True),
+                OmegaConf.to_container(defaults.scheduler, resolve=True),
+                int(defaults.n_iterations),
+                start,
+                steps,
+                lr_scale,
+            )
+            print(f"Continuing {base_checkpoint} from step {start} to {steps}, schedule: {' '.join(schedule)}", flush=True)
+            overrides += schedule
 
     threedgrut_training.train_3dgrut(config_name, overrides, threedgrut_training.DEFAULT_THREEDGRUT_CONFIG_DIR)
     if not checkpoint.is_file():
@@ -731,6 +785,8 @@ def run_artifixer3d(args: argparse.Namespace) -> None:
             steps=args.artifixer3d_steps,
             use_wandb=args.use_wandb,
             replace=args.replace,
+            rescale_schedule=args.rescale_schedule,
+            lr_scale=args.lr_scale,
         )
     elif "render" in phases and not checkpoint.is_file():
         raise FileNotFoundError(f"Missing ArtiFixer3D checkpoint for render phase: {checkpoint}")

@@ -68,6 +68,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional initial 3DGRUT checkpoint to resume from. Defaults to training ArtiFixer3D from scratch.",
     )
     parser.add_argument(
+        "--rescale_schedule",
+        action="store_true",
+        default=False,
+        help=(
+            "With --base_checkpoint: replay the config's densification windows and position LR decay "
+            "between the checkpoint's step and --artifixer3d_steps, scaled to that many steps."
+        ),
+    )
+    parser.add_argument(
+        "--lr_scale",
+        type=float,
+        default=1.0,
+        help="With --rescale_schedule: the position LR restarts at this fraction of the config's initial LR.",
+    )
+    parser.add_argument(
         "--artifixer3d_steps",
         type=int,
         default=30000,
