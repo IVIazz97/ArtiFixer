@@ -431,9 +431,15 @@ metric_scale() {  # metres per scene unit of the scene, if known (empty, not an 
   sed -n 's/^Scale factor: *\([^ ]*\).*/\1/p' "$SR/metric_alignment/scale_info.txt" | head -1
 }
 
+ckpt_steps() {  # ckpt_steps .../ckpt_N.pt -> N: renders land in ours_N, so prepare must look there (loop rounds > 1)
+  local name
+  name=$(basename "$1" .pt)
+  echo "${name#ckpt_}"
+}
+
 prepare_photos() {  # prepare_photos ROOT CHECKPOINT: prepared scene root (photos, transforms) over CHECKPOINT
   local prep=("$PY" -m data_processing.prepare_colmap_artifixer_inputs --colmap_dir "$COLMAP" --output_root "$1"
-              --reconstruction_checkpoint "$2" --reconstruction_steps 30000 ${FORCE:+--replace})
+              --reconstruction_checkpoint "$2" --reconstruction_steps "$(ckpt_steps "$2")" ${FORCE:+--replace})
   "${prep[@]}" --phases prepare
 }
 
@@ -455,7 +461,7 @@ print((root / entry["prompt_path"]).resolve())' "$SR")
     "$PY" output/jobs/write_caption.py --caption "$SCENE_CAPTION" --output_path "$caption" --text_encoder_model_id "$MODEL_ID"
   fi
   "$PY" -m data_processing.prepare_colmap_artifixer_inputs --colmap_dir "$COLMAP" --output_root "$root" \
-      --reconstruction_checkpoint "$ckpt" --reconstruction_steps 30000 ${FORCE:+--replace} \
+      --reconstruction_checkpoint "$ckpt" --reconstruction_steps "$(ckpt_steps "$ckpt")" ${FORCE:+--replace} \
       --phases render,scale --trajectory_path "$trajectory" ${scale:+--metric_scale "$scale"}
   [ -f "$root/split.json" ] || { echo "prepare wrote no $root/split.json (trajectory renders incomplete?)"; return 1; }
 }

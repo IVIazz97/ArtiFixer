@@ -408,6 +408,18 @@ def validate_selected_anchor_poses(
             )
 
 
+def shared_camera_id(cameras: list[Camera], ids: dict[tuple, int], camera: Camera) -> int:
+    """Id of camera's intrinsics in cameras, appending it only if no earlier frame has them.
+
+    3DGRUT keeps two full-resolution ray maps per COLMAP camera on the GPU, so one camera per frame
+    runs out of memory on long captures (1240 frames at 1600x900 need 43 GB of rays alone)."""
+    key = (camera.model, int(camera.width), int(camera.height), tuple(np.round(np.asarray(camera.params, dtype=np.float64), 6)))
+    if key not in ids:
+        ids[key] = camera.id
+        cameras.append(camera)
+    return ids[key]
+
+
 def write_colmap_cameras(path: Path, cameras: list[Camera]) -> None:
     """Write cameras.bin because 3DGRUT trains from COLMAP binary inputs."""
     opencv_model = CAMERA_MODEL_NAMES["OPENCV"]
@@ -484,6 +496,7 @@ def materialize_distillation_input(
     validate_selected_anchor_poses(scene, frames, applied_transform, source_images)
     selected = set(scene.selected_indices)
     colmap_cameras = []
+    camera_ids: dict[tuple, int] = {}
     colmap_images = []
     for index, frame in enumerate(frames):
         assert isinstance(frame, dict), f"Frame {index} metadata must be a mapping"
@@ -496,16 +509,20 @@ def materialize_distillation_input(
             source_image = source_images[source_basename]
             with PILImage.open(source) as image:
                 image_size = image.size
-            camera_id = len(colmap_cameras) + 1
-            colmap_cameras.append(
-                opencv_camera_from_colmap(camera_id, source_cameras[source_image.camera_id], image_size)
+            camera_id = shared_camera_id(
+                colmap_cameras,
+                camera_ids,
+                opencv_camera_from_colmap(len(colmap_cameras) + 1, source_cameras[source_image.camera_id], image_size),
             )
             qvec, tvec = source_image.qvec, source_image.tvec
         else:
             source = artifixer_frames_dir / f"{index:05d}.png"
             image_name = prediction_image_name(index)
-            camera_id = len(colmap_cameras) + 1
-            colmap_cameras.append(opencv_camera_from_mapping(camera_id, camera_intrinsics_for_frame(transforms, frame)))
+            camera_id = shared_camera_id(
+                colmap_cameras,
+                camera_ids,
+                opencv_camera_from_mapping(len(colmap_cameras) + 1, camera_intrinsics_for_frame(transforms, frame)),
+            )
             symlink_frame(source, paths.override_image_dir / f"{index:05d}.png")
             qvec, tvec = colmap_pose_from_transforms_frame(frame, applied_transform)
         symlink_frame(source, image_dir / image_name)

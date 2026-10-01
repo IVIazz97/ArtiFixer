@@ -200,8 +200,9 @@ def main(argv=None):
     batch = newest_batch(O / "artifixer")
     plus = newest_batch(O / "af3d_plus")
     columns = []  # (label, frame files)
-    render_dir = args.render_dir or (batch / "rendered" if batch else
-                                     V / "recon_results" / scene / "reconstruction" / scene / "ours_30000" / "trajectory" / "renders")
+    steps = sorted((V / "recon_results" / scene / "reconstruction" / scene).glob("ours_*/trajectory/renders"),
+                   key=lambda p: p.stat().st_mtime)  # ours_30000, or the step of the model a loop round started from
+    render_dir = args.render_dir or (batch / "rendered" if batch else steps[-1] if steps else None)
     renders = frame_files(render_dir, n)
     if renders:
         columns.append(("3DGUT render of the path" + ("" if args.render_dir else " (ArtiFixer input)"), renders))
