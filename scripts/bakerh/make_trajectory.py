@@ -19,7 +19,8 @@ was trained in) and writes a camera path in one of three modes (--mode):
     --standoff x R (or than its photo, if that was closer), and it looks at the centre of mass
     (--look_at blends the photo's rotation, 0, with looking at the object, 1).
   vidsplat: short orbits in the spirit of VidSplat (Tang et al., SIGGRAPH 2026, Sec. 3.3,
-    "visibility-based camera pose sampling"). For seed photos spread over the capture, the anchor
+    "visibility-based camera pose sampling"). For seed photos spread evenly over the capture (--seeds,
+    at least two per orbit; --phase_offset moves them by that share of one seed spacing), the anchor
     is where the photo's central ray meets the surface; 8 directions x --orbit_deg extents of
     orbits about the anchor are tried (yaw about the vertical, pitch about the horizontal, the
     camera rigidly rotated so the anchor stays at the image centre), --clip_len frames each. A
@@ -27,7 +28,9 @@ was trained in) and writes a camera path in one of three modes (--mode):
     not blocked by a near surface (paper: min depth > d0), shows no more than --s_high unseen area
     (area of surface no photo observes; a camera behind a wall sees the wall's unobserved back),
     and at its end shows at least --s_low more unseen area than the photo (paper: S_low < area(M)).
-    Per seed the valid orbit that reveals the most is kept. The path is frame 0 = the first seed
+    Per seed the valid orbit that reveals the most is kept; the capture is cut into one stretch per
+    orbit wanted and each stretch gets its seed with the most revealing orbit (a stretch without a valid
+    one leaves its place to the next best seed anywhere, then to second orbits). The path is frame 0 = the first seed
     photo, then the clips in capture order: every clip starts at an index = 1 (mod 4), so no
     4-frame VAE group of ArtiFixer mixes two orbits. The paper's +25% tail is not generated.
 
@@ -133,6 +136,8 @@ def build_parser():
     vid.add_argument("--orbit_deg", type=str, default="15,30,45", help="Orbit extents tried, degrees.")
     vid.add_argument("--max_elev", type=float, default=60.0, help="Highest/lowest camera elevation about the anchor, degrees.")
     vid.add_argument("--budget", type=int, default=None, help="Total frames; default one per photo.")
+    vid.add_argument("--seeds", type=int, default=12,
+                     help="Seed photos tried, spread evenly over the capture (at least two per orbit wanted).")
     vid.add_argument("--min_clips", type=int, default=None, help="Fail below this many valid orbits; default half of them.")
     vid.add_argument("--s_low", type=float, default=0.03, help="Minimum extra unseen area at the end of an orbit.")
     vid.add_argument("--s_high", type=float, default=0.4, help="Maximum unseen (and extra empty) area on a keyframe.")
@@ -666,8 +671,10 @@ def vidsplat_path(args, photos, gaussians, clearance, checker):
     field, keep = occupancy_field(gaussians, args.solid, photos.pos)
     photo_blocked = field.alpha(photos.pos, clearance) > args.solid
     d0_base = args.d0_m / args.metric_scale if args.metric_scale else None
-    m = min(n, 2 * n_clips)
-    seeds = np.unique(np.round(np.linspace(0, n - 1, m) + args.phase_offset * 2 * (n - 1) / max(m - 1, 1)).astype(int) % n)
+    # Seeds every n/m photos; --phase_offset moves them by that share of one spacing, so loop round k
+    # (offset (k-1)/rounds) tries the photos between the earlier rounds' seeds.
+    m = min(n, max(args.seeds, 2 * n_clips))
+    seeds = np.unique(np.round((np.arange(m) + args.phase_offset) * n / m).astype(int) % n)
     counts = dict.fromkeys(REJECT_REASONS, 0)
     per_seed = {}
     for j in seeds:
@@ -719,10 +726,16 @@ def vidsplat_path(args, photos, gaussians, clearance, checker):
         if valid:
             per_seed[int(j)] = sorted(valid, key=lambda c: (c.gain, c.extent), reverse=True)
 
-    # Seeds spread over the capture first (every other one of the oversampled list), then the rest,
-    # then a second orbit at least 90 degrees from the first.
-    order = [int(j) for j in seeds[::2]] + [int(j) for j in seeds[1::2]]
-    chosen = [per_seed[j][0] for j in order if j in per_seed][:n_clips]
+    # One orbit per stretch of the capture (n_clips equal stretches): the seed whose orbit reveals the
+    # most. Stretches without a valid orbit leave their place to the best remaining seeds anywhere, then
+    # to a second orbit at least 90 degrees from a chosen seed's first.
+    order = sorted(per_seed, key=lambda j: (-per_seed[j][0].gain, j))
+    stretch = {j: min(j * n_clips // n, n_clips - 1) for j in order}
+    best = {}
+    for j in order:
+        best.setdefault(stretch[j], j)
+    picked = sorted(best.values()) + [j for j in order if j not in best.values()]
+    chosen = [per_seed[j][0] for j in picked[:n_clips]]
     if len(chosen) < n_clips:
         vec = lambda c: np.array(directions[c.direction])  # noqa: E731
         for j in order:
@@ -734,6 +747,7 @@ def vidsplat_path(args, photos, gaussians, clearance, checker):
                 chosen.append(second)
     chosen.sort(key=lambda c: (c.seed, -c.gain))
     info = {"clip_len": L, "clips_wanted": n_clips, "min_clips": min_clips, "seeds_tried": len(seeds),
+            "seed_indices": seeds.tolist(), "valid_seeds": sorted(per_seed),
             "rejected": counts, "orbit_deg": [float(np.degrees(e)) for e in extents],
             "clips": [{"seed": photos.names[c.seed], "seed_index": c.seed, "direction": c.direction,
                        "extent_deg": c.extent, "anchor": c.anchor.tolist(), "anchor_distance": c.radius, "d0": c.d0,

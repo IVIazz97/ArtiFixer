@@ -16,7 +16,8 @@
 #   bash scripts/bakerh/run_loop.sh --fg   runs in this terminal instead
 # Knobs: MODES (vidsplat; object or travel repeat that path with a shifted weave each round), SCENES,
 # JOBS (e.g. JOBS="PCV:loop_vidsplat"), LOOP_ROUNDS, LOOP_STEPS, LOOP_LR, LOOP_DISTILL, TRAJ_*, GPU, FORCE=1.
-# Rerunning skips finished rounds. Report: output/bakerh_removal/logs/latest/REPORT.txt
+# Rerunning skips finished rounds; run_loop_fresh.sh moves the earlier loop folders aside and starts
+# clean. Report: output/bakerh_removal/logs/latest/REPORT.txt
 # Outputs: output/bakerh_removal/<scene>/loop_<mode>/
 #   round_<k>/            the round: new_path.png (top view of the new path), trajectory_input.json (all
 #                         paths so far), artifixer/ (ArtiFixer on the new frames), pred_all/ (every fixed

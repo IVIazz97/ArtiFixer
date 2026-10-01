@@ -42,8 +42,9 @@
 #                     surface while no keyframe shows more than TRAJ_S_HIGH (0.4) unseen area, none is
 #                     blocked by a surface closer than TRAJ_D0_M (0.5) m, and the last shows at least
 #                     TRAJ_S_LOW (0.03) more than the photo. TRAJ_BUDGET frames in all (default one per
-#                     photo, at most TRAJ_MAX_FRAMES). Fails the phase when fewer than half the
-#                     orbits are valid.
+#                     photo, at most TRAJ_MAX_FRAMES). Tries TRAJ_SEEDS (12, at least two per orbit)
+#                     seed photos spread evenly over the capture, one orbit per stretch of it. Fails
+#                     the phase when fewer than half the orbits are valid.
 #   travel            the earlier weave: TRAJ_SIDE (2) median photo spacings across the direction of
 #                     travel and TRAJ_UP (0.5) up, keeping the photo rotations.
 # PREVIEW=1 stops after the path and its 3DGUT renders (phases [vobject,] vprep, vdebug: top view +
@@ -163,6 +164,7 @@ TRAJ_ORBIT_DEG=${TRAJ_ORBIT_DEG:-15,30,45}
 TRAJ_S_LOW=${TRAJ_S_LOW:-0.03}
 TRAJ_S_HIGH=${TRAJ_S_HIGH:-0.4}
 TRAJ_BUDGET=${TRAJ_BUDGET:-}
+TRAJ_SEEDS=${TRAJ_SEEDS:-12}
 TRAJ_MAX_FRAMES=${TRAJ_MAX_FRAMES:-}
 LOOP_ROUNDS=${LOOP_ROUNDS:-5}
 LOOP_STEPS=${LOOP_STEPS:-5000}
@@ -481,7 +483,7 @@ build_traj_args() {  # build_traj_args CHECKPOINT: make_trajectory.py arguments 
       [ "$TRAJ_ALLOW_FALLBACK" = 0 ] || TRAJ_ARGS+=(--allow_fallback) ;;
     vidsplat)
       TRAJ_ARGS+=(--mode vidsplat --colmap_dir "$COLMAP" --clip_len "$TRAJ_CLIP" --orbit_deg "$TRAJ_ORBIT_DEG"
-                  --s_low "$TRAJ_S_LOW" --s_high "$TRAJ_S_HIGH" ${TRAJ_BUDGET:+--budget "$TRAJ_BUDGET"}) ;;
+                  --s_low "$TRAJ_S_LOW" --s_high "$TRAJ_S_HIGH" --seeds "$TRAJ_SEEDS" ${TRAJ_BUDGET:+--budget "$TRAJ_BUDGET"}) ;;
     travel)
       TRAJ_ARGS+=(--mode travel --side "$TRAJ_SIDE" --up "$TRAJ_UP") ;;
   esac

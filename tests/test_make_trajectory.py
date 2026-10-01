@@ -347,6 +347,33 @@ class VidsplatModeTest(unittest.TestCase):
             self.assertFalse(first & second, "round 2 repeated an orbit whose views are already seen")
             self.assertGreater(info2["rejected"]["nothing_new"], info["rejected"]["nothing_new"])
 
+    def test_seeds_spread_over_the_capture_and_between_rounds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rounds = []
+            for k in range(3):  # a small scene's loop: one orbit per round, phase (k-1)/3 of a seed spacing
+                code, out, info, photos = self.run_mode(tmp, ["--budget", "17", "--phase_offset", str(k / 3)])
+                self.assertEqual(code, 0, info.get("failed"))
+                self.assertEqual(info["clips_wanted"], 1)
+                seeds = info["seed_indices"]
+                self.assertEqual(len(seeds), 12)
+                gaps = np.diff(seeds + [seeds[0] + len(photos)])
+                self.assertLessEqual(gaps.max() - gaps.min(), 1, seeds)  # evenly over the whole capture
+                self.assertIn(info["clips"][0]["seed_index"], info["valid_seeds"])
+                rounds.append(set(seeds))
+            for a in range(3):
+                for b in range(a + 1, 3):
+                    self.assertFalse(rounds[a] & rounds[b], f"rounds {a + 1} and {b + 1} try the same seed photos")
+
+    def test_one_orbit_per_stretch_of_the_capture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out, info, photos = self.run_mode(tmp, ["--budget", "49", "--seeds", "24"])
+            self.assertEqual(code, 0, info.get("failed"))
+            n, wanted = len(photos), info["clips_wanted"]
+            self.assertEqual((wanted, info["seeds_tried"]), (3, 24))
+            stretches = {min(s * wanted // n, wanted - 1) for s in info["valid_seeds"]}
+            got = [min(c["seed_index"] * wanted // n, wanted - 1) for c in info["clips"]]
+            self.assertEqual(sorted(set(got)), sorted(stretches)[:len(info["clips"])], got)
+
     def test_fails_loudly(self):
         with tempfile.TemporaryDirectory() as tmp:
             code, out, info, _ = self.run_mode(tmp, ["--s_high", "0.001"])
