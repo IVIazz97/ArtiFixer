@@ -9,6 +9,8 @@ from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 from threedgrut.trainer import Trainer3DGRUT
 
+from data_processing import stream_camera_rays
+
 DEFAULT_THREEDGRUT_CONFIG_DIR = (
     Path(__file__).resolve().parents[1] / "thirdparty" / "3DGRUT-ArtiFixer" / "configs"
 )
@@ -29,5 +31,6 @@ def compose_3dgrut_config(config_name: str, overrides: list[str], config_dir: Pa
 
 
 def train_3dgrut(config_name: str, overrides: list[str], config_dir: Path) -> None:
+    stream_camera_rays.install()  # one camera's rays on the GPU at a time, not every frame's
     trainer = Trainer3DGRUT(compose_3dgrut_config(config_name, overrides, config_dir))
     trainer.run_training()

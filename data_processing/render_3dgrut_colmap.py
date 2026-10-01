@@ -13,6 +13,7 @@ from pathlib import Path
 
 from threedgrut.render import Renderer
 
+from data_processing import stream_camera_rays
 from data_processing.camera_trajectories import write_json
 
 RENDER_FRAME_DIRS = ("renders", "opacity")
@@ -131,6 +132,7 @@ def render_3dgrut_colmap(
     flashsplat_num_obj: int | None = None,
     flashsplat_require_object_mask: bool | None = None,
 ) -> Path:
+    stream_camera_rays.install()  # one camera's rays on the GPU at a time, not every frame's
     dataset_dir = render_dataset_dir or colmap_dir
     config_overrides = {
         "path": str(colmap_dir),
