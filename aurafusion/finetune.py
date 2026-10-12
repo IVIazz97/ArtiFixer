@@ -11,12 +11,18 @@ outside it 0.8 L1 + 0.2 (1 - SSIM); 10k iterations with 3DGS learning rates.
 Deviations: no densification (the official densifies every 300 iterations until 1000) and no
 2DGS normal/distortion regularisers, which have no 3DGUT counterpart.
 
+af360v (virtual views from ``virtual_views``): ``--in_frame_only`` keeps the in-mask terms only for
+views whose unseen mask is fully inside the image (``frame_views.in_frame``); a view that cuts the
+hole only gets the outside term. With ``--virtual_json`` the virtual views' final renders go to
+final/virtual_rgb/<i>.png, so final/rgb holds the real views only, numbered as without them.
+
 Writes <render_dir>/final/{ckpt_final.pt, rgb/<i>.png}.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
@@ -40,6 +46,12 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=10_000)
     parser.add_argument("--lambda_dssim", type=float, default=0.2)
     parser.add_argument("--lambda_lpips", type=float, default=0.5)
+    parser.add_argument("--in_frame_only", action="store_true",
+                        help="In-mask loss only for views whose unseen mask does not touch the image border.")
+    parser.add_argument("--frame_margin", type=float, default=0.01, help="frame_views.in_frame margin.")
+    parser.add_argument("--virtual_json", type=Path, default=None,
+                        help="virtual.json: render the virtual views to final/virtual_rgb instead of final/rgb.")
+    parser.add_argument("--summary", type=Path, default=None, help="Append a one-line human-readable summary here.")
     args = parser.parse_args()
     root = args.render_dir
     out = root / "final"
@@ -67,10 +79,26 @@ def main() -> None:
 
     dataset, _ = build_dataset(conf, num_workers=0)
     batches, targets, masks = [], [], []
+    missing = [i for i in range(len(dataset)) if not (root / "sdedit" / f"{i:05d}.png").exists()]
+    if missing:
+        raise SystemExit(f"finetune: {len(missing)} of {len(dataset)} SDEdit targets missing in {root / 'sdedit'} "
+                         f"(e.g. {missing[:5]}); rerun sdedit")
     for index in range(len(dataset)):
         batches.append(dataset.get_gpu_batch_with_intrinsics(torch.utils.data.default_collate([dataset[index]])))
         targets.append(torch.from_numpy(np.asarray(Image.open(root / "sdedit" / f"{index:05d}.png").convert("RGB"))).cuda())
         masks.append(torch.from_numpy(np.asarray(Image.open(root / "unseen_dilated" / f"{index:05d}.png")) > 127).cuda())
+    supervise_hole = [True] * len(dataset)
+    if args.in_frame_only:
+        from aurafusion.frame_views import in_frame
+
+        supervise_hole = [in_frame(m.cpu().numpy(), args.frame_margin) for m in masks]
+        print(f"in-mask loss on {sum(supervise_hole)}/{len(dataset)} views (unseen mask inside the frame): "
+              f"{[i for i, s in enumerate(supervise_hole) if s]}")
+        print(f"outside loss only (mask cut by the border or empty): {[i for i, s in enumerate(supervise_hole) if not s]}")
+        if not any(supervise_hole):  # e.g. a partial capture: better plain af360 than a failed job
+            print("WARNING FALLBACK: no view frames the whole unseen mask; the in-mask loss goes back to every view "
+                  "(as af360; check virtual_views / frame_views logs)")
+            supervise_hole = [True] * len(dataset)
 
     generator = torch.Generator().manual_seed(0)
     order: list[int] = []
@@ -85,7 +113,7 @@ def main() -> None:
         gt = targets[index].float() / 255.0
         m = masks[index][..., None].float()
         loss = 0.8 * F.l1_loss(image * (1 - m), gt * (1 - m)) + 0.2 * (1 - ssim(image * (1 - m), gt * (1 - m)))
-        if masks[index].any():
+        if masks[index].any() and supervise_hole[index]:
             loss = loss + (1 - args.lambda_dssim) * F.l1_loss(image * m, gt * m) \
                 + args.lambda_dssim * (1 - ssim(image * m, gt * m))
             ys, xs = torch.nonzero(masks[index], as_tuple=True)
@@ -99,6 +127,7 @@ def main() -> None:
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
+        last_loss = loss.item()
         if iteration % 1000 == 0 or iteration == 1:
             print(f"iter {iteration}/{args.iterations}: loss {loss.item():.4f}", flush=True)
 
@@ -107,9 +136,19 @@ def main() -> None:
     model.setup_optimizer()
     torch.save(model.get_model_parameters() | {"global_step": int(checkpoint["global_step"]), "epoch": 0,
                                                "aurafusion_num_fixed": num_fixed}, out / "ckpt_final.pt")
+    num_real = len(batches)
+    if args.virtual_json is not None:
+        num_real = json.loads(args.virtual_json.read_text())["num_real"]
     with torch.no_grad():
         for index, batch in enumerate(batches):
-            save_png(render_view(model, batch, index)["rgb"], out / "rgb" / f"{index:05d}.png")
+            folder = "rgb" if index < num_real else "virtual_rgb"
+            save_png(render_view(model, batch, index)["rgb"], out / folder / f"{index:05d}.png")
+    print(f"final renders: {out / 'rgb'} ({num_real} real views)"
+          + (f", {out / 'virtual_rgb'} ({len(batches) - num_real} virtual)" if num_real < len(batches) else ""))
+    if args.summary is not None:
+        with open(args.summary, "a") as f:
+            f.write(f"af360v finetune: {args.iterations} iters, in-hole loss on {sum(supervise_hole)}/{len(batches)} views, "
+                    f"last loss {last_loss:.4f}, {model.num_gaussians - num_fixed} new Gaussians -> {out}\n")
     print(f"Done: {out}")
 
 

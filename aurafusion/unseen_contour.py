@@ -18,6 +18,9 @@ other view frames counts as unseen (nothing can show it). For a capture that doe
 around the object the official mean never reaches theta, because every view that looks away
 counts as having seen the point. The default ``auto`` keeps the official result unless it is
 empty in every view, and only then uses ``in_view``; the choice goes to unseen_contour.json.
+
+``--virtual_json`` (af360v, from ``virtual_views``): only the real views vote on whether a point is
+seen. The virtual views are renders, not observations; they still get a contour of their own.
 """
 
 from __future__ import annotations
@@ -41,6 +44,8 @@ def main() -> None:
     parser.add_argument("--denominator", choices=("all", "in_view", "auto"), default="auto",
                         help="all: official mean over every view showing the object; in_view: mean over the views "
                              "the point lands in; auto: all, or in_view when all is empty in every view.")
+    parser.add_argument("--virtual_json", type=Path, default=None,
+                        help="virtual.json of virtual_views: its virtual views receive a contour but never vote.")
     parser.add_argument("--chunk", type=int, default=65536)
     args = parser.parse_args()
 
@@ -54,6 +59,13 @@ def main() -> None:
     ]).to(device)  # [J, H, W]
     J, H, W = regions.shape
     has_object = regions.flatten(1).any(1)
+    voters = has_object.clone()
+    if args.virtual_json is not None:
+        num_real = json.loads(args.virtual_json.read_text())["num_real"]
+        if not 0 < num_real <= J:
+            raise SystemExit(f"unseen_contour: {args.virtual_json} says {num_real} real views but {root} has {J} views")
+        voters[num_real:] = False
+        print(f"{int(voters.sum())} real views showing the object vote; {J - num_real} virtual views get a contour only")
 
     def unseen_contours(denominator: str) -> tuple[list[torch.Tensor], list[float]]:
         contours, fractions = [], []
@@ -63,7 +75,7 @@ def main() -> None:
             if region.any():
                 depth = torch.from_numpy(np.load(root / "removed" / "depth" / f"{n:05d}.npy")).to(device)
                 points = unproject(camera, depth, region)
-                others = [j for j in range(J) if j != n and bool(has_object[j])]
+                others = [j for j in range(J) if j != n and bool(voters[j])]
                 hidden = torch.zeros(points.shape[0], device=device)
                 framed = torch.zeros_like(hidden)
                 for s in range(0, points.shape[0], args.chunk):

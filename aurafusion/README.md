@@ -42,6 +42,39 @@ Models are pre-fetched into `checkpoints/aurafusion/` (compute nodes are offline
 
 OpenCLIP ViT-H laion2b weights live in the HF cache.
 
+## Variant af360v: virtual views that frame the whole hole
+
+In close-up captures, the image border often cuts the removed object. The reference (LaMa + AGDD) and
+the SDEdit targets are then built on only part of the hole, so the inpainting is inconsistent.
+af360v (`run_removal.sh SCENE af360v`, or `output/jobs/aurafusion/run_af360v.sbatch` on mip360) adds
+virtual views and runs the same stages on them:
+
+1. `virtual_views` (artifixer env) uses the same removal as `render_views`.
+   - It boxes the object's Gaussians: a PCA box, trimmed at 99.5%.
+   - From every real camera it builds one candidate. The candidate is re-aimed at the box centre,
+     keeps the real camera's up direction and intrinsics, and is pulled back until all 8 corners lie
+     6% inside the image border.
+   - It rejects a candidate when other geometry hides more than 15% of the object, more than 30% of
+     the image is very near, the view is mostly empty, or the camera had to move back more than 4×.
+   - It keeps 24 candidates by farthest-point sampling on view direction.
+   - It renders the full scene from each kept view as its "photo".
+   - Output: a COLMAP scene `colmap_virtual/` with the real views first, unchanged, then
+     `zzz_virtual_*.png`, plus `virtual.json` and the contact sheet `virtual_views.png`.
+2. `render_views`, `agdd` and `init_gaussians` run on `colmap_virtual` without changes.
+3. `unseen_contour --virtual_json` lets only real views vote on seen/unseen. Virtual views still get a
+   contour.
+4. `frame_views` picks the reference. A view's processed unseen mask is "in frame" when it stays 1% of
+   the shorter side away from the border. The reference is the largest in-frame real view, else the
+   largest in-frame virtual view. The result goes to `in_frame.json`.
+5. `finetune --in_frame_only --virtual_json` applies the in-mask L1/SSIM/LPIPS loss only on in-frame
+   views. Every view keeps the outside loss. Real views render to `final/rgb/<i>.png` with af360's
+   numbering; virtual views render to `final/virtual_rgb/`.
+
+`virtual_views`, `frame_views` and `finetune` take `--summary FILE`. With it, each appends one line
+about what it decided to that file: camera counts and rejection reasons, the reference and whether it is
+real or virtual, and how many views supervise the hole. `run_removal.sh` points it at
+`$O/job_summary.txt`, which `run_all.sh` copies into REPORT.txt.
+
 ## Validation
 
 On mip360 kitchen (same frames as the official Other-360/kitchen), our stage 1–3 unseen masks

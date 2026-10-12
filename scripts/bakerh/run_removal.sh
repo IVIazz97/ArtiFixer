@@ -19,6 +19,15 @@
 #                       FlashSplat uses
 #              af360sam AuraFusion360 with its own removal: an object probability distilled into the
 #                       Gaussians from the MASK_DIR masks, > 0.6 plus the IQR-filtered hull (official)
+#              af360v   af360 plus virtual cameras that frame the whole hole (see "af360v" below): the
+#                       reference and the in-hole loss come only from views that frame it
+#              surflift SurfaceLift (our method, surflift/README.md) on the 3DGUT reconstruction: observation
+#                       ledger, hole = only what no photo saw in the best REAL view, LaMa there, MoGe-2 depth,
+#                       surface-bound lift, then AF360's LeftRefill on every view's ledger hole (+ shadow)
+#                       and a colour fit of the lifted Gaussians (see "SurfaceLift" below)
+#              surfliftv the same, but the fill view must hold the WHOLE hole inside the frame: a real view
+#                       whose mask clears the border, or a virtual camera re-aimed at the object and pulled
+#                       back until it fits (blocked / empty ones rejected)
 #              run_sequence.sh runs vanilla, then every inpainting variant on all three scenes.
 #
 # Part 1 (default): prep, flashsplat, derive, split, infer. Ends with a single-rollout ArtiFixer
@@ -85,8 +94,8 @@
 # Outputs: output/bakerh_removal/<scene>/<variant>/. Logs: .../logs/<timestamp>/NN_<phase>.log and
 # .../logs/summary.log (start, end, duration and peak GPU memory of every phase, across runs).
 set -euo pipefail
-SCENE=${1:?usage: run_removal.sh SCENE VARIANT   (SCENE: TA_BLUE_MOTOR|PCV|TA_TURBINE|G35|Compressor, VARIANT: normal|bighull|vanilla[_object|_vidsplat|_travel]|loop_<mode>|once_<mode>|scratch_<mode>|i360|af360|i360sam|af360sam)}
-VARIANT=${2:?usage: run_removal.sh SCENE VARIANT   (VARIANT: normal|bighull|vanilla[_object|_vidsplat|_travel]|loop_<mode>|once_<mode>|scratch_<mode>|i360|af360|i360sam|af360sam)}
+SCENE=${1:?usage: run_removal.sh SCENE VARIANT   (SCENE: TA_BLUE_MOTOR|PCV|TA_TURBINE|G35|Compressor, VARIANT: normal|bighull|vanilla[_object|_vidsplat|_travel]|loop_<mode>|once_<mode>|scratch_<mode>|i360|af360|i360sam|af360sam|af360v|surflift|surfliftv)}
+VARIANT=${2:?usage: run_removal.sh SCENE VARIANT   (VARIANT: normal|bighull|vanilla[_object|_vidsplat|_travel]|loop_<mode>|once_<mode>|scratch_<mode>|i360|af360|i360sam|af360sam|af360v|surflift|surfliftv)}
 AF=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$AF"
 
@@ -154,8 +163,9 @@ case $VARIANT in
     [ "$VARIANT" = vanilla ] || TRAJ_MODE=${VARIANT#vanilla_}
     # One path frame per photo: all 923 Compressor photos would not fit through ArtiFixer.
     [ "$S" != Compressor ] || { echo "vanilla is for TA_BLUE_MOTOR, PCV and TA_TURBINE only" >&2; exit 2; } ;;
-  i360|af360|i360sam|af360sam) HOLE_SHAPE=none; DILATE=0; export HF_HUB_OFFLINE=1 ;;
-  *) echo "unknown VARIANT '$VARIANT' (normal, bighull, vanilla, vanilla_object, vanilla_vidsplat, vanilla_travel, {loop,once,scratch}_{object,vidsplat,travel}, i360, af360, i360sam, af360sam)" >&2; exit 2 ;;
+  i360|af360|i360sam|af360sam|af360v) HOLE_SHAPE=none; DILATE=0; export HF_HUB_OFFLINE=1 ;;
+  surflift|surfliftv) HOLE_SHAPE=none; DILATE=0; export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 ;;
+  *) echo "unknown VARIANT '$VARIANT' (normal, bighull, vanilla, vanilla_object, vanilla_vidsplat, vanilla_travel, {loop,once,scratch}_{object,vidsplat,travel}, i360, af360, i360sam, af360sam, af360v, surflift, surfliftv)" >&2; exit 2 ;;
 esac
 TRAJ_MODE=${TRAJ_MODE:-object}
 case $TRAJ_MODE in object|vidsplat|travel) ;; *) echo "unknown TRAJ_MODE '$TRAJ_MODE' (object, vidsplat, travel)" >&2; exit 2 ;; esac
@@ -224,6 +234,10 @@ elif [ -z "${PHASES:-}" ] && [ "$VARIANT" = i360sam ]; then
   PHASES=views,i360masks,i360associate,i360distill,i360remove,i360virtual,i360nbs,i360lama,i360init,i360finetune
 elif [ -z "${PHASES:-}" ] && [ "$VARIANT" = af360sam ]; then
   PHASES=views,afsegmasks,afsegdistill,afsegremove,afrender,afcontour,afsam2,afagdd,afinit,afsdedit,affinetune
+elif [ -z "${PHASES:-}" ] && [ "$VARIANT" = af360v ]; then
+  PHASES=afvviews,flashsplat,afvirtual,afvrender,afvcontour,afsam2,afvref,afvagdd,afvinit,afsdedit,afvfinetune
+elif [ -z "${PHASES:-}" ] && [[ $VARIANT == surflift || $VARIANT == surfliftv ]]; then
+  PHASES=slviews,flashsplat,slprep,slledger,slselect,slinpaint,sldepth,sllift,slholes,slrefill,slfit
 elif [ -z "${PHASES:-}" ]; then
   PHASES=prep,flashsplat,derive,split,infer
   if [ -n "${SEEDS:-}" ]; then
@@ -261,7 +275,7 @@ N=0
 # One line to the screen, this run's summary.log and the variant's cumulative summary.log.
 note() { echo "[$(date '+%F %T')] $S/$VARIANT $*" | tee -a "$SUMMARY" "$LOG_DIR/summary.log"; }
 
-if [[ $VARIANT == i360* || $VARIANT == af360* ]] && [ -z "$USER_PHASES" ] && [ -z "${FORCE:-}" ] \
+if [[ $VARIANT == i360* || $VARIANT == af360* || $VARIANT == surflift* ]] && [ -z "$USER_PHASES" ] && [ -z "${FORCE:-}" ] \
     && [ -f "$O/final/ckpt_final.pt" ] \
     && [ "$(cat "$O/views.txt" 2>/dev/null || echo "${FRAMES:-all}")" = "${FRAMES:-all}" ]; then
   note "SKIP: already finished on views ${FRAMES:-all} ($O/final; FORCE=1 redoes it)"
@@ -274,7 +288,9 @@ needed=("$PY" "$CKPT" "$CHECKPOINT_PT" "$MODEL_ID" "$COLMAP")
 case $VARIANT in
   i360)           needed+=("$LAMA") ;;
   i360sam)        needed+=("$LAMA" "$AF_PY") ;;
-  af360|af360sam) needed+=("$LAMA" "$MARIGOLD" "$SD2_CKPT" "$AF360_REPO/utils/LeftRefill" "$AF_PY") ;;
+  af360|af360sam|af360v) needed+=("$LAMA" "$MARIGOLD" "$SD2_CKPT" "$AF360_REPO/utils/LeftRefill" "$AF_PY") ;;
+  surflift|surfliftv) needed+=("$LAMA" "${MOGE:-$AF/checkpoints/moge-2-vitl-normal/model.pt}" "$SD2_CKPT" "$AF360_REPO/utils/LeftRefill" "$AF_PY")
+                  [ "${SL_EDITOR:-lama}" != qwen ] || needed+=("${QWEN_DIR:-$MODELS/Qwen-Image-Edit-2511}") ;;
 esac
 for f in "${needed[@]}"; do
   [ -e "$f" ] || missing+=("$f")
@@ -888,6 +904,127 @@ phase_affinetune() {
   "$PY" -m aurafusion.finetune --render_dir "$O" --colmap_dir "$PCOLMAP"
 }
 
+# af360v: af360 on the real views ($PCOLMAP, i.e. FRAMES applied) plus virtual cameras re-aimed at the
+# object and pulled back until it is fully in frame, blocked/empty ones rejected (aurafusion.virtual_views;
+# AFV_VIEWS of them, default 24, full-scene renders as their photos, in $O/colmap_virtual after the real
+# ones). Virtual views never vote in the unseen contour. The reference is the largest unseen mask among
+# the views that frame it whole (real first, else virtual; aurafusion.frame_views -> $O/in_frame.json),
+# and only those views supervise the inside of the hole. final/rgb: real views, numbered as in af360;
+# final/virtual_rgb: virtual ones. The af* wrappers below run the af360 phase on the derived scene.
+# Decisions (camera counts and rejections, reference, views supervising the hole) go to the phase logs
+# and one line each to $O/job_summary.txt, recreated by afvviews.
+VCOLMAP=$O/colmap_virtual
+afv_note() { echo "$*" | tee -a "$O/job_summary.txt"; }
+phase_afvviews() {
+  mkdir -p "$O"
+  : > "$O/job_summary.txt"
+  afv_note "af360v on $S: views ${FRAMES:-all}, flashsplat $FSP, $(date '+%F %T')"
+  phase_views
+}
+phase_afvirtual() {
+  "$PY" -m aurafusion.virtual_views --checkpoint "$CKPT" --colmap_dir "$PCOLMAP" --flashsplat_dir "$FSP" \
+      --output_dir "$O" --num_views "${AFV_VIEWS:-24}" --summary "$O/job_summary.txt"
+}
+phase_afvrender() { PCOLMAP=$VCOLMAP phase_afrender; }
+phase_afvcontour() {
+  "$PY" -m aurafusion.unseen_contour --render_dir "$O" --virtual_json "$O/virtual.json"
+  afv_note "af360v unseen contour: $(cat "$O/unseen_contour.json")"
+}
+phase_afvref() {
+  "$PY" -m aurafusion.frame_views --render_dir "$O" --virtual_json "$O/virtual.json" --summary "$O/job_summary.txt" \
+      > "$O/reference_index.txt"
+  [ -s "$O/reference_index.txt" ] || { echo "frame_views wrote no reference index to $O/reference_index.txt" >&2; exit 1; }
+  local ref
+  ref=$(af_ref)
+  [ -z "${REF_INDEX:-}" ] || afv_note "af360v: REF_INDEX=$REF_INDEX overrides the reference"
+  echo "reference view: $ref ($([ "$ref" -ge "$("$PY" -c 'import json, sys; print(json.load(open(sys.argv[1]))["num_real"])' \
+      "$O/virtual.json")" ] && echo virtual || echo real)); details: $O/in_frame.json"
+}
+phase_afvagdd() { PCOLMAP=$VCOLMAP phase_afagdd; }
+phase_afvinit() { PCOLMAP=$VCOLMAP phase_afinit; }
+phase_afvfinetune() {
+  "$PY" -m aurafusion.finetune --render_dir "$O" --colmap_dir "$VCOLMAP" --in_frame_only --virtual_json "$O/virtual.json" \
+      --summary "$O/job_summary.txt"
+}
+
+# SurfaceLift 3DGUT port (surflift/README.md): every stage is one phase; each prints its decisions and
+# appends one line to $O/job_summary.txt (recreated by slviews). Work files: $O/sl, final model: $O/final.
+# Knobs: SL_EDITOR (lama | qwen: Qwen-Image-Edit-2511 from QWEN_DIR, CPU offload), MOGE, SL_SHARE (1:
+# surfliftv copies surflift's prepare + ledger when they were made on the same views), SL_SEEN_WEIGHT
+# (ledger, 1.0), SL_REFILL_ARGS / SL_SELECT_ARGS / SL_FIT_ARGS (extra flags).
+SLW=$O/sl
+MOGE=${MOGE:-$AF/checkpoints/moge-2-vitl-normal/model.pt}
+QWEN_DIR=${QWEN_DIR:-$MODELS/Qwen-Image-Edit-2511}
+sl_common() { echo --checkpoint "$CKPT" --colmap_dir "$PCOLMAP" --work "$SLW"; }
+sl_note() { echo "$*" | tee -a "$O/job_summary.txt"; }
+sl_shared() {  # surflift's prepare + ledger, if this surfliftv run may reuse them
+  local src=$OUT_ROOT/$S/surflift
+  [ "$VARIANT" = surfliftv ] && [ "${SL_SHARE:-1}" = 1 ] && [ -s "$src/sl/ledger/keep.npy" ] \
+    && [ "$(cat "$src/views.txt" 2>/dev/null)" = "${FRAMES:-all}" ] \
+    && [ "$(cat "$src/sl/seen_weight.txt" 2>/dev/null)" = "${SL_SEEN_WEIGHT:-1.0}" ] && echo "$src/sl"
+}
+phase_slviews() {
+  mkdir -p "$O"
+  : > "$O/job_summary.txt"
+  sl_note "$VARIANT on $S: views ${FRAMES:-all}, masks $MASK_DIR, editor ${SL_EDITOR:-lama}, $(date '+%F %T')"
+  phase_views
+  rm -rf "$SLW"                               # a redo starts clean: every stage reads the previous ones
+  mkdir -p "$SLW"
+}
+phase_slprep() {
+  local src
+  src=$(sl_shared || true)
+  if [ -n "$src" ]; then
+    cp -r "$src/masks" "$SLW/" && cp "$src/removal.pt" "$src/cameras.json" "$src/prepare.json" "$SLW/"
+    sl_note "prepare: reused from $src"
+    return
+  fi
+  "$PY" -m surflift.prepare $(sl_common) --flashsplat_dir "$FSP" --mask_dir "$MASK_DIR"
+}
+phase_slledger() {
+  local src
+  src=$(sl_shared || true)
+  if [ -n "$src" ]; then
+    cp -r "$src/ledger" "$SLW/" && cp "$src/seen_weight.txt" "$SLW/"
+    sl_note "ledger: reused from $src ($(tr -d '\n' < "$src/ledger/stats.json" | grep -o '"cleaned_scene": [0-9]*'))"
+    return
+  fi
+  "$PY" -m surflift.clean $(sl_common) --seen_weight "${SL_SEEN_WEIGHT:-1.0}"
+  echo "${SL_SEEN_WEIGHT:-1.0}" > "$SLW/seen_weight.txt"
+}
+phase_slselect() {
+  local mode=real
+  [ "$VARIANT" = surfliftv ] && mode=contain
+  "$PY" -m surflift.select_view $(sl_common) --mode $mode ${SL_SELECT_ARGS:-}
+  echo "chosen view: $(cat "$SLW/select/camera.json" | tr -d '\n' | grep -o '"name": "[^"]*"'); sheet $SLW/select/top.jpg"
+}
+phase_slinpaint() {
+  if [ "${SL_EDITOR:-lama}" = qwen ]; then
+    "$PY" -m surflift.inpaint --work "$SLW" --editor qwen --qwen_dir "$QWEN_DIR"
+  else
+    "$PY" -m surflift.inpaint --work "$SLW" --editor lama --lama_model "$LAMA"
+  fi
+}
+phase_sldepth() {
+  "$PY" -m surflift.depth --work "$SLW" --moge "$MOGE"
+}
+phase_sllift() {
+  "$PY" -m surflift.lift $(sl_common)
+}
+phase_slholes() {
+  "$PY" -m surflift.holes $(sl_common)
+}
+phase_slrefill() {
+  TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 "$AF_PY" -m surflift.leftrefill --work "$SLW" --official_repo "$AF360_REPO" \
+      --sd2_inpainting_ckpt "$SD2_CKPT" ${SL_REFILL_ARGS:-}
+}
+phase_slfit() {
+  "$PY" -m surflift.fit $(sl_common) --final "$O/final" --lama_model "$LAMA" ${SL_FIT_ARGS:-}
+  [ -s "$O/final/ckpt_final.pt" ] || { echo "no $O/final/ckpt_final.pt"; return 1; }
+  sl_note "stage times / peak GPU memory (GiB): $(tr '\n' ' ' < "$SLW/stages.txt" | grep -o '"stage": "[a-z]*", "seconds": [0-9.]*, "peak_alloc_gib": [0-9.a-z]*' | sed 's/"stage": //; s/"seconds": //; s/"peak_alloc_gib": //' | tr '\n' ';')"
+  sl_note "outputs: $O/final/ckpt_final.pt, $O/final/rgb ($(ls "$O/final/rgb" | wc -l) views), chosen view $SLW/select, LeftRefill $SLW/leftrefill/refined"
+}
+
 {
   echo "scene=$S variant=$VARIANT phases=$PHASES seeds=${SEEDS:-} gpu=$GPU"
   echo "scene_root=$SR"; echo "flashsplat_src=$FS_SRC"; echo "flashsplat_out=$FS"; echo "masks=${MASK_DIR:-}"
@@ -945,7 +1082,7 @@ if [[ ",$PHASES," == *,vaf3dplus,* ]]; then
   echo "ArtiFixer3D renders:  $(find "$V/artifixer3d" -type d -name renders 2>/dev/null | head -1)"
   echo "ArtiFixer3D+ output:"; find "$O/af3d_plus" -name '*.mp4' | head -5
 fi
-if [[ ",$PHASES," == *,i360finetune,* || ",$PHASES," == *,affinetune,* ]]; then
+if [[ ",$PHASES," == *,i360finetune,* || ",$PHASES," == *,affinetune,* || ",$PHASES," == *,afvfinetune,* || ",$PHASES," == *,slfit,* ]]; then
   echo
   echo "Final renders ($VARIANT, every view): $O/final/rgb"
   [ -d "$O/final/virtual_rgb" ] && echo "Virtual views: $O/final/virtual_rgb"

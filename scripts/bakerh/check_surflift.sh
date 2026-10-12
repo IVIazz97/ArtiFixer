@@ -156,9 +156,9 @@ done
 # line of the variant's cumulative logs/summary.log (where an unfinished run stopped).
 # ---------------------------------------------------------------------------------------------
 section "baseline runs (output/bakerh_removal/<scene>/<variant>)"
-printf '  %-14s %-9s %-10s %-14s %-8s %s\n' scene variant status views renders last
+printf '  %-14s %-10s %-10s %-14s %-8s %s\n' scene variant status views renders last
 for S in TA_BLUE_MOTOR PCV Compressor; do
-  for v in af360 af360sam i360 i360sam; do
+  for v in af360 af360v surflift surfliftv af360sam i360 i360sam; do
     O=$AF/output/bakerh_removal/$S/$v
     views=$(cat "$O/views.txt" 2>/dev/null || echo -)
     n=$(ls "$O/final/rgb" 2>/dev/null | grep -c '\.png$')
@@ -167,7 +167,7 @@ for S in TA_BLUE_MOTOR PCV Compressor; do
     elif [ -d "$O" ]; then st=UNFINISHED; todo+=("$S $v unfinished: bash scripts/bakerh/run_removal.sh $S $v")
     else st="not run"; todo+=("$S $v not run: bash scripts/bakerh/run_removal.sh $S $v")
     fi
-    printf '  %-14s %-9s %-10s %-14s %-8s %s\n' "$S" "$v" "$st" "$views" "$n" "${last:--}"
+    printf '  %-14s %-10s %-10s %-14s %-8s %s\n' "$S" "$v" "$st" "$views" "$n" "${last:--}"
   done
 done
 

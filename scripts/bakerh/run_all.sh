@@ -125,6 +125,12 @@ for s in TA_BLUE_MOTOR PCV TA_TURBINE Compressor; do
   done
 done
 
+# PRECHECK: a read-only check script (e.g. check_surflift.sh) whose whole output goes into the report.
+if [ -n "${PRECHECK:-}" ]; then
+  section "precheck: $PRECHECK"
+  timeout 900 bash "$PRECHECK" >> "$REPORT" 2>&1 || echo "(precheck exit $?: see the lines above)" >> "$REPORT"
+fi
+
 results=()
 for job in $JOBS; do
   scene=${job%%:*} variant=${job##*:}
@@ -140,6 +146,11 @@ for job in $JOBS; do
   job_logs=$OUT_ROOT/$scene/$variant/logs/latest
   section "job $job: $status ($((took / 60)) min)"
   cat "$job_logs/summary.log" >> "$REPORT" 2>/dev/null
+  # job_summary.txt: what the variant decided (chosen views, camera counts, ...), written by its phases.
+  if [ -s "$OUT_ROOT/$scene/$variant/job_summary.txt" ]; then
+    echo "--- $scene/$variant/job_summary.txt" >> "$REPORT"
+    tail -60 "$OUT_ROOT/$scene/$variant/job_summary.txt" >> "$REPORT"
+  fi
   if [ -d "$OUT_ROOT/$scene/$variant/round_1" ]; then  # loop jobs: what every round chose and trained
     "$PY" - "$OUT_ROOT/$scene/$variant" >> "$REPORT" 2>&1 <<'PYEOF'
 import json, sys
