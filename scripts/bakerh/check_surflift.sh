@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Read-only check: is everything SurfaceLift needs on this VM? Downloads nothing, changes nothing.
+# Read-only check: is everything SurfaceLift needs on this VM, and which AuraFusion360 / Inpaint360GS
+# baseline runs are finished? Downloads nothing, changes nothing.
 #
 # SurfaceLift (CVPR2027/SurfaceLift) fills the hole left by an object removal from ONE chosen view:
 # inpaint that view, MoGe-2 depth aligned to the removed scene, Gaussians bound to that surface,
@@ -38,6 +39,7 @@ echo "MODELS=$MODELS   AF360_REPO=$AF360_REPO   GPU=$GPU"
 # Models. Columns: need (required|engine|optional), label, path to check, min bytes, source, size.
 #   required = core SurfaceLift (chosen-view inpainting with LaMa, MoGe-2 depth)
 #   engine   = LeftRefill refinement inside the ledger hole (our best 360-USID variant)
+#   af360    = only the AuraFusion360 runs themselves need it (SAM2 unseen masks, Marigold AGDD)
 #   optional = Qwen-Image-Edit-2511 chosen-view editor (the v3c default on Leonardo; LaMa replaces it)
 # ---------------------------------------------------------------------------------------------
 section "models"
@@ -76,6 +78,10 @@ check_file engine "OpenCLIP ViT-H-14 laion2B" "$MODELS/CLIP-ViT-H-14-laion2B-s32
 check_file engine "LeftRefill learned prompt" \
   "$AF360_REPO/utils/LeftRefill/check_points/ref_guided_inpainting/ckpts/epoch=7-step=6039.ckpt" 100000 \
   "git clone https://github.com/kkennethwu/AuraFusion360_official.git (or: bash scripts/bakerh/setup_baselines.sh)" "GitHub"
+check_file af360 "SAM2 hiera-large" "$MODELS/sam2-hiera-large/sam2_hiera_large.pt" 800000000 \
+  "hf download facebook/sam2-hiera-large sam2_hiera_large.pt --local-dir sam2-hiera-large" "900 MB"
+check_dir af360 "Marigold depth v1-0" "$MODELS/marigold-depth-v1-0" "model_index.json unet vae text_encoder tokenizer scheduler" \
+  "hf download prs-eth/marigold-v1-0 --local-dir marigold-depth-v1-0" "~5 GB (fp32) / 2.6 GB (fp16 files only)"
 check_dir optional "Qwen-Image-Edit-2511 (editor)" "$MODELS/Qwen-Image-Edit-2511" \
   "model_index.json transformer text_encoder vae processor tokenizer scheduler" \
   "hf download Qwen/Qwen-Image-Edit-2511 --local-dir Qwen-Image-Edit-2511" "54 GB"
@@ -145,6 +151,27 @@ for S in TA_BLUE_MOTOR PCV Compressor; do
 done
 
 # ---------------------------------------------------------------------------------------------
+# Baseline runs (run_removal.sh): finished = final/ckpt_final.pt, the same rule run_removal.sh uses to
+# skip a job. views = the FRAMES the run used (views.txt); renders = final/rgb PNGs; last = the last
+# line of the variant's cumulative logs/summary.log (where an unfinished run stopped).
+# ---------------------------------------------------------------------------------------------
+section "baseline runs (output/bakerh_removal/<scene>/<variant>)"
+printf '  %-14s %-9s %-10s %-14s %-8s %s\n' scene variant status views renders last
+for S in TA_BLUE_MOTOR PCV Compressor; do
+  for v in af360 af360sam i360 i360sam; do
+    O=$AF/output/bakerh_removal/$S/$v
+    views=$(cat "$O/views.txt" 2>/dev/null || echo -)
+    n=$(ls "$O/final/rgb" 2>/dev/null | grep -c '\.png$')
+    last=$(tail -n 1 "$O/logs/summary.log" 2>/dev/null | cut -c1-110)
+    if [ -f "$O/final/ckpt_final.pt" ]; then st=DONE
+    elif [ -d "$O" ]; then st=UNFINISHED; todo+=("$S $v unfinished: bash scripts/bakerh/run_removal.sh $S $v")
+    else st="not run"; todo+=("$S $v not run: bash scripts/bakerh/run_removal.sh $S $v")
+    fi
+    printf '  %-14s %-9s %-10s %-14s %-8s %s\n' "$S" "$v" "$st" "$views" "$n" "${last:--}"
+  done
+done
+
+# ---------------------------------------------------------------------------------------------
 section "disk"
 df -h "$AF" "$MODELS" 2>/dev/null | awk 'NR == 1 || !seen[$0]++'
 
@@ -193,6 +220,7 @@ if [ ${#missing[@]} -gt 0 ]; then
     echo "       put at:  $path"
   done
   echo "  required = SurfaceLift cannot run without it; engine = LeftRefill refinement (best variant);"
+  echo "  af360 = only the AuraFusion360 baseline runs need it;"
   echo "  optional = Qwen editor for the chosen view (LaMa is used instead when it is absent)."
 fi
 if [ ${#todo[@]} -gt 0 ]; then
